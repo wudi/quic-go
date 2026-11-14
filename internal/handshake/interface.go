@@ -1,11 +1,12 @@
 package handshake
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"io"
-	"time"
 
+	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/wire"
 )
@@ -37,7 +38,7 @@ type LongHeaderOpener interface {
 type ShortHeaderOpener interface {
 	headerDecryptor
 	DecodePacketNumber(wirePN protocol.PacketNumber, wirePNLen protocol.PacketNumberLen) protocol.PacketNumber
-	Open(dst, src []byte, rcvTime time.Time, pn protocol.PacketNumber, kp protocol.KeyPhaseBit, associatedData []byte) ([]byte, error)
+	Open(dst, src []byte, rcvTime monotime.Time, pn protocol.PacketNumber, kp protocol.KeyPhaseBit, associatedData []byte) ([]byte, error)
 }
 
 // LongHeaderSealer seals a long header packet
@@ -68,9 +69,12 @@ const (
 	EventWriteInitialData
 	// EventWriteHandshakeData contains new CRYPTO data to send at the Handshake encryption level
 	EventWriteHandshakeData
-	// EventReceivedReadKeys signals that new decryption keys are available.
-	// It doesn't say which encryption level those keys are for.
-	EventReceivedReadKeys
+	// EventReceived0RTTReadKeys signals that 0-RTT decryption keys are available.
+	EventReceived0RTTReadKeys
+	// EventReceivedHandshakeReadKeys signals that Handshake decryption keys are available.
+	EventReceivedHandshakeReadKeys
+	// EventReceived1RTTReadKeys signals that 1-RTT decryption keys are available.
+	EventReceived1RTTReadKeys
 	// EventDiscard0RTTKeys signals that the Handshake keys were discarded.
 	EventDiscard0RTTKeys
 	// EventReceivedTransportParameters contains the transport parameters sent by the peer.
@@ -82,6 +86,33 @@ const (
 	EventHandshakeComplete
 )
 
+func (k EventKind) String() string {
+	switch k {
+	case EventNoEvent:
+		return "EventNoEvent"
+	case EventWriteInitialData:
+		return "EventWriteInitialData"
+	case EventWriteHandshakeData:
+		return "EventWriteHandshakeData"
+	case EventReceived0RTTReadKeys:
+		return "EventReceived0RTTReadKeys"
+	case EventReceivedHandshakeReadKeys:
+		return "EventReceivedHandshakeReadKeys"
+	case EventReceived1RTTReadKeys:
+		return "EventReceived1RTTReadKeys"
+	case EventDiscard0RTTKeys:
+		return "EventDiscard0RTTKeys"
+	case EventReceivedTransportParameters:
+		return "EventReceivedTransportParameters"
+	case EventRestoredTransportParameters:
+		return "EventRestoredTransportParameters"
+	case EventHandshakeComplete:
+		return "EventHandshakeComplete"
+	default:
+		return "Unknown EventKind"
+	}
+}
+
 // Event is a handshake event.
 type Event struct {
 	Kind                EventKind
@@ -91,7 +122,7 @@ type Event struct {
 
 // CryptoSetup handles the handshake and protecting / unprotecting packets
 type CryptoSetup interface {
-	StartHandshake() error
+	StartHandshake(context.Context) error
 	io.Closer
 	ChangeConnectionID(protocol.ConnectionID)
 	GetSessionTicket() ([]byte, error)

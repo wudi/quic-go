@@ -3,21 +3,21 @@ package self_test
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
 	"net"
+	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/testutils/simnet"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
 type clientSessionCache struct {
 	cache tls.ClientSessionCache
-
-	gets chan<- string
-	puts chan<- string
+	gets  chan<- string
+	puts  chan<- string
 }
 
 func newClientSessionCache(cache tls.ClientSessionCache, gets, puts chan<- string) *clientSessionCache {
@@ -32,103 +32,40 @@ var _ tls.ClientSessionCache = &clientSessionCache{}
 
 func (c *clientSessionCache) Get(sessionKey string) (*tls.ClientSessionState, bool) {
 	session, ok := c.cache.Get(sessionKey)
-	c.gets <- sessionKey
+	if c.gets != nil {
+		c.gets <- sessionKey
+	}
 	return session, ok
 }
 
 func (c *clientSessionCache) Put(sessionKey string, cs *tls.ClientSessionState) {
 	c.cache.Put(sessionKey, cs)
-	c.puts <- sessionKey
+	if c.puts != nil {
+		c.puts <- sessionKey
+	}
 }
 
-var _ = Describe("TLS session resumption", func() {
-	It("uses session resumption", func() {
-		server, err := quic.ListenAddr("localhost:0", getTLSConfig(), getQuicConfig(nil))
-		Expect(err).ToNot(HaveOccurred())
-		defer server.Close()
-
-		gets := make(chan string, 100)
-		puts := make(chan string, 100)
-		cache := newClientSessionCache(tls.NewLRUClientSessionCache(10), gets, puts)
-		tlsConf := getTLSClientConfig()
-		tlsConf.ClientSessionCache = cache
-		conn1, err := quic.DialAddr(
-			context.Background(),
-			fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
-			tlsConf,
-			getQuicConfig(nil),
-		)
-		Expect(err).ToNot(HaveOccurred())
-		defer conn1.CloseWithError(0, "")
-		var sessionKey string
-		Eventually(puts).Should(Receive(&sessionKey))
-		Expect(conn1.ConnectionState().TLS.DidResume).To(BeFalse())
-
-		serverConn, err := server.Accept(context.Background())
-		Expect(err).ToNot(HaveOccurred())
-		Expect(serverConn.ConnectionState().TLS.DidResume).To(BeFalse())
-
-		conn2, err := quic.DialAddr(
-			context.Background(),
-			fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
-			tlsConf,
-			getQuicConfig(nil),
-		)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(gets).To(Receive(Equal(sessionKey)))
-		Expect(conn2.ConnectionState().TLS.DidResume).To(BeTrue())
-
-		serverConn, err = server.Accept(context.Background())
-		Expect(err).ToNot(HaveOccurred())
-		Expect(serverConn.ConnectionState().TLS.DidResume).To(BeTrue())
-		conn2.CloseWithError(0, "")
+func TestTLSSessionResumption(t *testing.T) {
+	t.Run("uses session resumption", func(t *testing.T) {
+		handshakeWithSessionResumption(t, getTLSConfig(), true)
 	})
 
-	It("doesn't use session resumption, if the config disables it", func() {
+	t.Run("large session ticket", func(t *testing.T) {
+		sConf := getTLSConfig()
+		sConf.WrapSession = func(cs tls.ConnectionState, ss *tls.SessionState) ([]byte, error) {
+			ss.Extra = append(ss.Extra, make([]byte, 5000))
+			return sConf.EncryptTicket(cs, ss)
+		}
+		handshakeWithSessionResumption(t, sConf, true)
+	})
+
+	t.Run("disabled in tls.Config", func(t *testing.T) {
 		sConf := getTLSConfig()
 		sConf.SessionTicketsDisabled = true
-		server, err := quic.ListenAddr("localhost:0", sConf, getQuicConfig(nil))
-		Expect(err).ToNot(HaveOccurred())
-		defer server.Close()
-
-		gets := make(chan string, 100)
-		puts := make(chan string, 100)
-		cache := newClientSessionCache(tls.NewLRUClientSessionCache(10), gets, puts)
-		tlsConf := getTLSClientConfig()
-		tlsConf.ClientSessionCache = cache
-		conn1, err := quic.DialAddr(
-			context.Background(),
-			fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
-			tlsConf,
-			getQuicConfig(nil),
-		)
-		Expect(err).ToNot(HaveOccurred())
-		defer conn1.CloseWithError(0, "")
-		Consistently(puts).ShouldNot(Receive())
-		Expect(conn1.ConnectionState().TLS.DidResume).To(BeFalse())
-
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		serverConn, err := server.Accept(ctx)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(serverConn.ConnectionState().TLS.DidResume).To(BeFalse())
-
-		conn2, err := quic.DialAddr(
-			context.Background(),
-			fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
-			tlsConf,
-			getQuicConfig(nil),
-		)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(conn2.ConnectionState().TLS.DidResume).To(BeFalse())
-		defer conn2.CloseWithError(0, "")
-
-		serverConn, err = server.Accept(context.Background())
-		Expect(err).ToNot(HaveOccurred())
-		Expect(serverConn.ConnectionState().TLS.DidResume).To(BeFalse())
+		handshakeWithSessionResumption(t, sConf, false)
 	})
 
-	It("doesn't use session resumption, if the config returned by GetConfigForClient disables it", func() {
+	t.Run("disabled in tls.Config.GetConfigForClient", func(t *testing.T) {
 		sConf := &tls.Config{
 			GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
 				conf := getTLSConfig()
@@ -136,9 +73,26 @@ var _ = Describe("TLS session resumption", func() {
 				return conf, nil
 			},
 		}
+		handshakeWithSessionResumption(t, sConf, false)
+	})
+}
 
-		server, err := quic.ListenAddr("localhost:0", sConf, getQuicConfig(nil))
-		Expect(err).ToNot(HaveOccurred())
+func handshakeWithSessionResumption(t *testing.T, serverTLSConf *tls.Config, expectSessionTicket bool) {
+	synctest.Test(t, func(t *testing.T) {
+		const rtt = 10 * time.Millisecond
+
+		n := &simnet.Simnet{Router: &simnet.PerfectRouter{}}
+		defer n.Close()
+		settings := simnet.NodeBiDiLinkSettings{Latency: rtt / 2}
+		clientPacketConn1 := n.NewEndpoint(&net.UDPAddr{IP: net.ParseIP("1.0.0.1"), Port: 9001}, settings)
+		defer clientPacketConn1.Close()
+		clientPacketConn2 := n.NewEndpoint(&net.UDPAddr{IP: net.ParseIP("1.0.0.2"), Port: 9001}, settings)
+		defer clientPacketConn2.Close()
+		serverPacketConn := n.NewEndpoint(&net.UDPAddr{IP: net.ParseIP("1.0.0.3"), Port: 9002}, settings)
+		defer serverPacketConn.Close()
+
+		server, err := quic.Listen(serverPacketConn, serverTLSConf, getQuicConfig(nil))
+		require.NoError(t, err)
 		defer server.Close()
 
 		gets := make(chan string, 100)
@@ -146,35 +100,57 @@ var _ = Describe("TLS session resumption", func() {
 		cache := newClientSessionCache(tls.NewLRUClientSessionCache(10), gets, puts)
 		tlsConf := getTLSClientConfig()
 		tlsConf.ClientSessionCache = cache
-		conn1, err := quic.DialAddr(
-			context.Background(),
-			fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
-			tlsConf,
-			getQuicConfig(nil),
-		)
-		Expect(err).ToNot(HaveOccurred())
-		Consistently(puts).ShouldNot(Receive())
-		Expect(conn1.ConnectionState().TLS.DidResume).To(BeFalse())
+
+		// first connection - doesn't use resumption
+		conn1, err := quic.Dial(context.Background(), clientPacketConn1, server.Addr(), tlsConf, getQuicConfig(nil))
+		require.NoError(t, err)
 		defer conn1.CloseWithError(0, "")
+		require.False(t, conn1.ConnectionState().TLS.DidResume)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		serverConn, err := server.Accept(ctx)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(serverConn.ConnectionState().TLS.DidResume).To(BeFalse())
+		var sessionKey string
+		select {
+		case sessionKey = <-puts:
+			if !expectSessionTicket {
+				t.Fatal("unexpected session ticket")
+			}
+		case <-time.After(time.Hour):
+			if expectSessionTicket {
+				t.Fatal("timeout waiting for session ticket")
+			}
+		}
 
-		conn2, err := quic.DialAddr(
-			context.Background(),
-			fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
-			tlsConf,
-			getQuicConfig(nil),
-		)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(conn2.ConnectionState().TLS.DidResume).To(BeFalse())
+		serverConn1, err := server.Accept(context.Background())
+		require.NoError(t, err)
+		require.False(t, serverConn1.ConnectionState().TLS.DidResume)
+		defer serverConn1.CloseWithError(0, "")
+
+		// second connection - will use resumption, if enabled
+		conn2, err := quic.Dial(context.Background(), clientPacketConn2, server.Addr(), tlsConf, getQuicConfig(nil))
+		require.NoError(t, err)
 		defer conn2.CloseWithError(0, "")
 
-		serverConn, err = server.Accept(context.Background())
-		Expect(err).ToNot(HaveOccurred())
-		Expect(serverConn.ConnectionState().TLS.DidResume).To(BeFalse())
+		select {
+		case k := <-gets:
+			if expectSessionTicket {
+				// we can only perform this check if we got a session ticket before
+				require.Equal(t, sessionKey, k)
+			}
+		case <-time.After(time.Hour):
+			if expectSessionTicket {
+				t.Fatal("timeout waiting for retrieval of session ticket")
+			}
+		}
+
+		serverConn2, err := server.Accept(context.Background())
+		require.NoError(t, err)
+		defer serverConn2.CloseWithError(0, "")
+
+		if expectSessionTicket {
+			require.True(t, conn2.ConnectionState().TLS.DidResume)
+			require.True(t, serverConn2.ConnectionState().TLS.DidResume)
+		} else {
+			require.False(t, conn2.ConnectionState().TLS.DidResume)
+			require.False(t, serverConn2.ConnectionState().TLS.DidResume)
+		}
 	})
-})
+}

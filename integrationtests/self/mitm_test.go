@@ -2,460 +2,434 @@ package self_test
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
-	"fmt"
 	"io"
 	"math"
+	mrand "math/rand/v2"
 	"net"
+	"slices"
+	"sync"
 	"sync/atomic"
+	"testing"
+	"testing/synctest"
 	"time"
 
-	"golang.org/x/exp/rand"
-
 	"github.com/quic-go/quic-go"
-	quicproxy "github.com/quic-go/quic-go/integrationtests/tools/proxy"
 	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/testutils"
 	"github.com/quic-go/quic-go/internal/wire"
+	"github.com/quic-go/quic-go/testutils"
+	"github.com/quic-go/quic-go/testutils/simnet"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("MITM test", func() {
-	const connIDLen = 6 // explicitly set the connection ID length, so the proxy can parse it
+const (
+	mitmTestConnIDLen = 6
+	mitmTestRTT       = 10 * time.Millisecond
+)
 
-	var (
-		clientUDPConn                    net.PacketConn
-		serverTransport, clientTransport *quic.Transport
-		serverConn                       quic.Connection
-		serverConfig                     *quic.Config
-	)
+// mitmPacket is a packet that is delivered after Delay, in addition to the link latency.
+type mitmPacket struct {
+	simnet.Packet
+	Delay time.Duration
+}
 
-	startServerAndProxy := func(delayCb quicproxy.DelayCallback, dropCb quicproxy.DropCallback) (proxyPort int, closeFn func()) {
-		addr, err := net.ResolveUDPAddr("udp", "localhost:0")
-		Expect(err).ToNot(HaveOccurred())
-		c, err := net.ListenUDP("udp", addr)
-		Expect(err).ToNot(HaveOccurred())
-		serverTransport = &quic.Transport{
-			Conn:               c,
-			ConnectionIDLength: connIDLen,
+// mitmRouter delivers the packets returned by Intercept instead of the packet that was sent.
+type mitmRouter struct {
+	simnet.PerfectRouter
+
+	ServerAddr net.Addr
+	Intercept  func(dir direction, p simnet.Packet) []mitmPacket
+}
+
+var _ simnet.Router = &mitmRouter{}
+
+func (r *mitmRouter) SendPacket(p simnet.Packet) error {
+	dir := direction(directionToClient)
+	if p.To.String() == r.ServerAddr.String() {
+		dir = directionToServer
+	}
+	for _, mp := range r.Intercept(dir, p) {
+		if mp.Delay > 0 {
+			time.AfterFunc(mp.Delay, func() { r.PerfectRouter.SendPacket(mp.Packet) })
+			continue
 		}
-		ln, err := serverTransport.Listen(getTLSConfig(), serverConfig)
-		Expect(err).ToNot(HaveOccurred())
-		done := make(chan struct{})
-		go func() {
-			defer GinkgoRecover()
-			defer close(done)
-			var err error
-			serverConn, err = ln.Accept(context.Background())
-			if err != nil {
-				return
-			}
-			str, err := serverConn.OpenUniStream()
-			Expect(err).ToNot(HaveOccurred())
-			_, err = str.Write(PRData)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(str.Close()).To(Succeed())
-		}()
-		serverPort := ln.Addr().(*net.UDPAddr).Port
-		proxy, err := quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-			RemoteAddr:  fmt.Sprintf("localhost:%d", serverPort),
-			DelayPacket: delayCb,
-			DropPacket:  dropCb,
-		})
-		Expect(err).ToNot(HaveOccurred())
-		return proxy.LocalPort(), func() {
-			proxy.Close()
-			ln.Close()
-			serverTransport.Close()
-			<-done
+		if err := r.PerfectRouter.SendPacket(mp.Packet); err != nil {
+			return err
 		}
 	}
+	return nil
+}
 
-	BeforeEach(func() {
-		serverConfig = getQuicConfig(nil)
-		addr, err := net.ResolveUDPAddr("udp", "localhost:0")
-		Expect(err).ToNot(HaveOccurred())
-		clientUDPConn, err = net.ListenUDP("udp", addr)
-		Expect(err).ToNot(HaveOccurred())
-		clientTransport = &quic.Transport{
-			Conn:               clientUDPConn,
-			ConnectionIDLength: connIDLen,
-		}
+func getTransportsForMITMTest(
+	t *testing.T,
+	intercept func(dir direction, p simnet.Packet) []mitmPacket,
+) (serverTransport, clientTransport *quic.Transport) {
+	clientConn, serverConn, closeFn := newSimnetLinkWithRouter(t, mitmTestRTT, &mitmRouter{
+		ServerAddr: &net.UDPAddr{IP: net.ParseIP("1.0.0.2"), Port: 9002},
+		Intercept:  intercept,
+	})
+	t.Cleanup(func() { closeFn(t) })
+
+	serverTransport = &quic.Transport{
+		Conn:               serverConn,
+		ConnectionIDLength: mitmTestConnIDLen,
+	}
+	addTracer(serverTransport)
+	t.Cleanup(func() { serverTransport.Close() })
+
+	clientTransport = &quic.Transport{
+		Conn:               clientConn,
+		ConnectionIDLength: mitmTestConnIDLen,
+	}
+	addTracer(clientTransport)
+	t.Cleanup(func() { clientTransport.Close() })
+
+	return serverTransport, clientTransport
+}
+
+func TestMITMInjectRandomPackets(t *testing.T) {
+	t.Run("towards the server", func(t *testing.T) {
+		testMITMInjectRandomPackets(t, directionToServer)
 	})
 
-	Context("unsuccessful attacks", func() {
-		AfterEach(func() {
-			Eventually(serverConn.Context().Done()).Should(BeClosed())
-			// Test shutdown is tricky due to the proxy. Just wait for a bit.
-			time.Sleep(50 * time.Millisecond)
-			Expect(clientUDPConn.Close()).To(Succeed())
-			Expect(clientTransport.Close()).To(Succeed())
+	t.Run("towards the client", func(t *testing.T) {
+		testMITMInjectRandomPackets(t, directionToClient)
+	})
+}
+
+func TestMITMDuplicatePackets(t *testing.T) {
+	t.Run("towards the server", func(t *testing.T) {
+		testMITMDuplicatePackets(t, directionToServer)
+	})
+
+	t.Run("towards the client", func(t *testing.T) {
+		testMITMDuplicatePackets(t, directionToClient)
+	})
+}
+
+func TestMITCorruptPackets(t *testing.T) {
+	t.Run("towards the server", func(t *testing.T) {
+		testMITMCorruptPackets(t, directionToServer)
+	})
+
+	t.Run("towards the client", func(t *testing.T) {
+		testMITMCorruptPackets(t, directionToClient)
+	})
+}
+
+func testMITMInjectRandomPackets(t *testing.T, dir direction) {
+	createRandomPacketOfSameType := func(b []byte) []byte {
+		if wire.IsLongHeaderPacket(b[0]) {
+			hdr, _, _, err := wire.ParsePacket(b)
+			if err != nil {
+				return nil
+			}
+			replyHdr := &wire.ExtendedHeader{
+				Header: wire.Header{
+					DestConnectionID: hdr.DestConnectionID,
+					SrcConnectionID:  hdr.SrcConnectionID,
+					Type:             hdr.Type,
+					Version:          hdr.Version,
+				},
+				PacketNumber:    protocol.PacketNumber(mrand.Int32N(math.MaxInt32 / 4)),
+				PacketNumberLen: protocol.PacketNumberLen(mrand.IntN(4) + 1),
+			}
+			payloadLen := mrand.IntN(100)
+			replyHdr.Length = protocol.ByteCount(mrand.IntN(payloadLen + 1))
+			data, err := replyHdr.Append(nil, hdr.Version)
+			if err != nil {
+				panic("failed to append header: " + err.Error())
+			}
+			r := make([]byte, payloadLen)
+			rand.Read(r)
+			return append(data, r...)
+		}
+		// short header packet
+		connID, err := wire.ParseConnectionID(b, mitmTestConnIDLen)
+		if err != nil {
+			return nil
+		}
+		_, pn, pnLen, _, err := wire.ParseShortHeader(b, mitmTestConnIDLen)
+		if err != nil && !errors.Is(err, wire.ErrInvalidReservedBits) { // normally, ParseShortHeader is called after decrypting the header
+			panic("failed to parse short header: " + err.Error())
+		}
+		data, err := wire.AppendShortHeader(nil, connID, pn, pnLen, protocol.KeyPhaseBit(mrand.IntN(2)))
+		if err != nil {
+			return nil
+		}
+		payloadLen := mrand.IntN(100)
+		r := make([]byte, payloadLen)
+		rand.Read(r)
+		return append(data, r...)
+	}
+
+	synctest.Test(t, func(t *testing.T) {
+		serverTransport, clientTransport := getTransportsForMITMTest(t, func(d direction, p simnet.Packet) []mitmPacket {
+			packets := []mitmPacket{{Packet: p}}
+			if d != dir {
+				return packets
+			}
+			for range 10 {
+				packets = append(packets, mitmPacket{
+					Packet: simnet.Packet{From: p.From, To: p.To, Data: createRandomPacketOfSameType(p.Data)},
+					Delay:  mrand.N(mitmTestRTT),
+				})
+			}
+			return packets
+		})
+		runMITMTest(t, serverTransport, clientTransport)
+	})
+}
+
+func testMITMDuplicatePackets(t *testing.T, dir direction) {
+	synctest.Test(t, func(t *testing.T) {
+		serverTransport, clientTransport := getTransportsForMITMTest(t, func(d direction, p simnet.Packet) []mitmPacket {
+			if d != dir {
+				return []mitmPacket{{Packet: p}}
+			}
+			return []mitmPacket{
+				{Packet: p},
+				{Packet: simnet.Packet{From: p.From, To: p.To, Data: slices.Clone(p.Data)}, Delay: mrand.N(mitmTestRTT)},
+			}
+		})
+		runMITMTest(t, serverTransport, clientTransport)
+	})
+}
+
+func testMITMCorruptPackets(t *testing.T, dir direction) {
+	synctest.Test(t, func(t *testing.T) {
+		var numCorrupted atomic.Int32
+		serverTransport, clientTransport := getTransportsForMITMTest(t, func(d direction, p simnet.Packet) []mitmPacket {
+			if d != dir {
+				return []mitmPacket{{Packet: p}}
+			}
+			isLongHeaderPacket := wire.IsLongHeaderPacket(p.Data[0])
+			// corrupt 20% of long header packets and 5% of short header packets
+			if isLongHeaderPacket && mrand.IntN(4) != 0 {
+				return []mitmPacket{{Packet: p}}
+			}
+			if !isLongHeaderPacket && mrand.IntN(20) != 0 {
+				return []mitmPacket{{Packet: p}}
+			}
+			numCorrupted.Add(1)
+			p.Data = slices.Clone(p.Data)
+			p.Data[mrand.IntN(len(p.Data))] = byte(mrand.IntN(256))
+			return []mitmPacket{{Packet: p}}
 		})
 
-		Context("injecting invalid packets", func() {
-			const rtt = 20 * time.Millisecond
+		runMITMTest(t, serverTransport, clientTransport)
+		t.Logf("corrupted %d packets", numCorrupted.Load())
+		require.NotZero(t, int(numCorrupted.Load()))
+	})
+}
 
-			sendRandomPacketsOfSameType := func(conn *quic.Transport, remoteAddr net.Addr, raw []byte) {
-				defer GinkgoRecover()
-				const numPackets = 10
-				ticker := time.NewTicker(rtt / numPackets)
-				defer ticker.Stop()
+func runMITMTest(t *testing.T, serverTr, clientTr *quic.Transport) {
+	ln, err := serverTr.Listen(getTLSConfig(), getQuicConfig(nil))
+	require.NoError(t, err)
+	defer ln.Close()
 
-				if wire.IsLongHeaderPacket(raw[0]) {
-					hdr, _, _, err := wire.ParsePacket(raw)
-					Expect(err).ToNot(HaveOccurred())
-					replyHdr := &wire.ExtendedHeader{
-						Header: wire.Header{
-							DestConnectionID: hdr.DestConnectionID,
-							SrcConnectionID:  hdr.SrcConnectionID,
-							Type:             hdr.Type,
-							Version:          hdr.Version,
-						},
-						PacketNumber:    protocol.PacketNumber(rand.Int31n(math.MaxInt32 / 4)),
-						PacketNumberLen: protocol.PacketNumberLen(rand.Int31n(4) + 1),
-					}
+	// corrupted handshake packets can lead to multiple PTOs with exponential backoff
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := clientTr.Dial(ctx, ln.Addr(), getTLSClientConfig(), getQuicConfig(nil))
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "")
 
-					for i := 0; i < numPackets; i++ {
-						payloadLen := rand.Int31n(100)
-						replyHdr.Length = protocol.ByteCount(rand.Int31n(payloadLen + 1))
-						b, err := replyHdr.Append(nil, hdr.Version)
-						Expect(err).ToNot(HaveOccurred())
-						r := make([]byte, payloadLen)
-						rand.Read(r)
-						b = append(b, r...)
-						if _, err := conn.WriteTo(b, remoteAddr); err != nil {
-							return
-						}
-						<-ticker.C
-					}
-				} else {
-					connID, err := wire.ParseConnectionID(raw, connIDLen)
-					Expect(err).ToNot(HaveOccurred())
-					_, pn, pnLen, _, err := wire.ParseShortHeader(raw, connIDLen)
-					if err != nil { // normally, ParseShortHeader is called after decrypting the header
-						Expect(err).To(MatchError(wire.ErrInvalidReservedBits))
-					}
-					for i := 0; i < numPackets; i++ {
-						b, err := wire.AppendShortHeader(nil, connID, pn, pnLen, protocol.KeyPhaseBit(rand.Intn(2)))
-						Expect(err).ToNot(HaveOccurred())
-						payloadLen := rand.Int31n(100)
-						r := make([]byte, payloadLen)
-						rand.Read(r)
-						b = append(b, r...)
-						if _, err := conn.WriteTo(b, remoteAddr); err != nil {
-							return
-						}
-						<-ticker.C
-					}
-				}
+	serverConn, err := ln.Accept(ctx)
+	require.NoError(t, err)
+	defer serverConn.CloseWithError(0, "")
+
+	str, err := conn.OpenStreamSync(ctx)
+	require.NoError(t, err)
+	clientErrChan := make(chan error, 1)
+	go func() {
+		_, err := str.Write(PRData)
+		clientErrChan <- err
+		str.Close()
+	}()
+
+	serverStr, err := serverConn.AcceptStream(ctx)
+	require.NoError(t, err)
+	serverErrChan := make(chan error, 1)
+	go func() {
+		defer close(serverErrChan)
+		if _, err := io.Copy(serverStr, serverStr); err != nil {
+			serverErrChan <- err
+			return
+		}
+		serverStr.Close()
+	}()
+	require.NoError(t, <-serverErrChan)
+
+	data, err := io.ReadAll(str)
+	require.NoError(t, err)
+	require.Equal(t, PRData, data)
+
+	select {
+	case err := <-clientErrChan:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+	select {
+	case err := <-serverErrChan:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+func TestMITMForgedVersionNegotiationPacket(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const supportedVersion protocol.Version = 42
+
+		var once sync.Once
+		serverTransport, clientTransport := getTransportsForMITMTest(t, func(d direction, p simnet.Packet) []mitmPacket {
+			packets := []mitmPacket{{Packet: p}}
+			if d != directionToServer {
+				return packets
 			}
-
-			runTest := func(delayCb quicproxy.DelayCallback) {
-				proxyPort, closeFn := startServerAndProxy(delayCb, nil)
-				defer closeFn()
-				raddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("localhost:%d", proxyPort))
-				Expect(err).ToNot(HaveOccurred())
-				conn, err := clientTransport.Dial(
-					context.Background(),
-					raddr,
-					getTLSClientConfig(),
-					getQuicConfig(nil),
+			once.Do(func() {
+				hdr, _, _, err := wire.ParsePacket(p.Data)
+				if err != nil {
+					panic("failed to parse packet: " + err.Error())
+				}
+				// create fake version negotiation packet with a fake supported version
+				packet := wire.ComposeVersionNegotiation(
+					protocol.ArbitraryLenConnectionID(hdr.SrcConnectionID.Bytes()),
+					protocol.ArbitraryLenConnectionID(hdr.DestConnectionID.Bytes()),
+					[]protocol.Version{supportedVersion},
 				)
-				Expect(err).ToNot(HaveOccurred())
-				str, err := conn.AcceptUniStream(context.Background())
-				Expect(err).ToNot(HaveOccurred())
-				data, err := io.ReadAll(str)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(data).To(Equal(PRData))
-				Expect(conn.CloseWithError(0, "")).To(Succeed())
-			}
-
-			It("downloads a message when the packets are injected towards the server", func() {
-				delayCb := func(dir quicproxy.Direction, raw []byte) time.Duration {
-					if dir == quicproxy.DirectionIncoming {
-						defer GinkgoRecover()
-						go sendRandomPacketsOfSameType(clientTransport, serverTransport.Conn.LocalAddr(), raw)
-					}
-					return rtt / 2
-				}
-				runTest(delayCb)
+				packets = append(packets, mitmPacket{Packet: simnet.Packet{From: p.To, To: p.From, Data: packet}})
 			})
-
-			It("downloads a message when the packets are injected towards the client", func() {
-				delayCb := func(dir quicproxy.Direction, raw []byte) time.Duration {
-					if dir == quicproxy.DirectionOutgoing {
-						defer GinkgoRecover()
-						go sendRandomPacketsOfSameType(serverTransport, clientTransport.Conn.LocalAddr(), raw)
-					}
-					return rtt / 2
-				}
-				runTest(delayCb)
-			})
+			return packets
 		})
 
-		runTest := func(dropCb quicproxy.DropCallback) {
-			proxyPort, closeFn := startServerAndProxy(nil, dropCb)
-			defer closeFn()
-			raddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("localhost:%d", proxyPort))
-			Expect(err).ToNot(HaveOccurred())
-			conn, err := clientTransport.Dial(
-				context.Background(),
-				raddr,
-				getTLSClientConfig(),
-				getQuicConfig(nil),
-			)
-			Expect(err).ToNot(HaveOccurred())
-			str, err := conn.AcceptUniStream(context.Background())
-			Expect(err).ToNot(HaveOccurred())
-			data, err := io.ReadAll(str)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(data).To(Equal(PRData))
-			Expect(conn.CloseWithError(0, "")).To(Succeed())
-		}
-
-		Context("duplicating packets", func() {
-			It("downloads a message when packets are duplicated towards the server", func() {
-				dropCb := func(dir quicproxy.Direction, raw []byte) bool {
-					defer GinkgoRecover()
-					if dir == quicproxy.DirectionIncoming {
-						_, err := clientTransport.WriteTo(raw, serverTransport.Conn.LocalAddr())
-						Expect(err).ToNot(HaveOccurred())
-					}
-					return false
-				}
-				runTest(dropCb)
-			})
-
-			It("downloads a message when packets are duplicated towards the client", func() {
-				dropCb := func(dir quicproxy.Direction, raw []byte) bool {
-					defer GinkgoRecover()
-					if dir == quicproxy.DirectionOutgoing {
-						_, err := serverTransport.WriteTo(raw, clientTransport.Conn.LocalAddr())
-						Expect(err).ToNot(HaveOccurred())
-					}
-					return false
-				}
-				runTest(dropCb)
-			})
-		})
-
-		Context("corrupting packets", func() {
-			const idleTimeout = time.Second
-
-			var numCorrupted, numPackets atomic.Int32
-
-			BeforeEach(func() {
-				numCorrupted.Store(0)
-				numPackets.Store(0)
-				serverConfig.MaxIdleTimeout = idleTimeout
-			})
-
-			AfterEach(func() {
-				num := numCorrupted.Load()
-				fmt.Fprintf(GinkgoWriter, "Corrupted %d of %d packets.", num, numPackets.Load())
-				Expect(num).To(BeNumerically(">=", 1))
-				// If the packet containing the CONNECTION_CLOSE is corrupted,
-				// we have to wait for the connection to time out.
-				Eventually(serverConn.Context().Done(), 3*idleTimeout).Should(BeClosed())
-			})
-
-			It("downloads a message when packet are corrupted towards the server", func() {
-				const interval = 4 // corrupt every 4th packet (stochastically)
-				dropCb := func(dir quicproxy.Direction, raw []byte) bool {
-					defer GinkgoRecover()
-					if dir == quicproxy.DirectionIncoming {
-						numPackets.Add(1)
-						if rand.Intn(interval) == 0 {
-							pos := rand.Intn(len(raw))
-							raw[pos] = byte(rand.Intn(256))
-							_, err := clientTransport.WriteTo(raw, serverTransport.Conn.LocalAddr())
-							Expect(err).ToNot(HaveOccurred())
-							numCorrupted.Add(1)
-							return true
-						}
-					}
-					return false
-				}
-				runTest(dropCb)
-			})
-
-			It("downloads a message when packet are corrupted towards the client", func() {
-				const interval = 10 // corrupt every 10th packet (stochastically)
-				dropCb := func(dir quicproxy.Direction, raw []byte) bool {
-					defer GinkgoRecover()
-					if dir == quicproxy.DirectionOutgoing {
-						numPackets.Add(1)
-						if rand.Intn(interval) == 0 {
-							pos := rand.Intn(len(raw))
-							raw[pos] = byte(rand.Intn(256))
-							_, err := serverTransport.WriteTo(raw, clientTransport.Conn.LocalAddr())
-							Expect(err).ToNot(HaveOccurred())
-							numCorrupted.Add(1)
-							return true
-						}
-					}
-					return false
-				}
-				runTest(dropCb)
-			})
-		})
+		err := runMITMTestSuccessful(t, serverTransport, clientTransport)
+		var vnErr *quic.VersionNegotiationError
+		require.ErrorAs(t, err, &vnErr)
+		require.Contains(t, vnErr.Theirs, supportedVersion) // might contain greased versions
 	})
+}
 
-	Context("successful injection attacks", func() {
-		// These tests demonstrate that the QUIC protocol is vulnerable to injection attacks before the handshake
-		// finishes. In particular, an adversary who can intercept packets coming from one endpoint and send a reply
-		// that arrives before the real reply can tear down the connection in multiple ways.
-
-		const rtt = 20 * time.Millisecond
-
-		runTest := func(delayCb quicproxy.DelayCallback) (closeFn func(), err error) {
-			proxyPort, serverCloseFn := startServerAndProxy(delayCb, nil)
-			raddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("localhost:%d", proxyPort))
-			Expect(err).ToNot(HaveOccurred())
-			_, err = clientTransport.Dial(
-				context.Background(),
-				raddr,
-				getTLSClientConfig(),
-				getQuicConfig(&quic.Config{HandshakeIdleTimeout: 2 * time.Second}),
-			)
-			return func() { clientTransport.Close(); serverCloseFn() }, err
-		}
-
-		// fails immediately because client connection closes when it can't find compatible version
-		It("fails when a forged version negotiation packet is sent to client", func() {
-			done := make(chan struct{})
-			delayCb := func(dir quicproxy.Direction, raw []byte) time.Duration {
-				if dir == quicproxy.DirectionIncoming {
-					defer GinkgoRecover()
-
-					hdr, _, _, err := wire.ParsePacket(raw)
-					Expect(err).ToNot(HaveOccurred())
-
-					if hdr.Type != protocol.PacketTypeInitial {
-						return 0
-					}
-
-					// Create fake version negotiation packet with no supported versions
-					versions := []protocol.VersionNumber{}
-					packet := wire.ComposeVersionNegotiation(
-						protocol.ArbitraryLenConnectionID(hdr.SrcConnectionID.Bytes()),
-						protocol.ArbitraryLenConnectionID(hdr.DestConnectionID.Bytes()),
-						versions,
-					)
-
-					// Send the packet
-					_, err = serverTransport.WriteTo(packet, clientTransport.Conn.LocalAddr())
-					Expect(err).ToNot(HaveOccurred())
-					close(done)
-				}
-				return rtt / 2
+// times out, because client doesn't accept subsequent real retry packets from server
+// as it has already accepted a retry.
+// TODO: determine behavior when server does not send Retry packets
+func TestMITMForgedRetryPacket(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var once sync.Once
+		serverTransport, clientTransport := getTransportsForMITMTest(t, func(d direction, p simnet.Packet) []mitmPacket {
+			packets := []mitmPacket{{Packet: p}}
+			hdr, _, _, err := wire.ParsePacket(p.Data)
+			if err != nil {
+				panic("failed to parse packet: " + err.Error())
 			}
-			closeFn, err := runTest(delayCb)
-			defer closeFn()
-			Expect(err).To(HaveOccurred())
-			vnErr := &quic.VersionNegotiationError{}
-			Expect(errors.As(err, &vnErr)).To(BeTrue())
-			Eventually(done).Should(BeClosed())
-		})
-
-		// times out, because client doesn't accept subsequent real retry packets from server
-		// as it has already accepted a retry.
-		// TODO: determine behavior when server does not send Retry packets
-		It("fails when a forged Retry packet with modified srcConnID is sent to client", func() {
-			serverConfig.RequireAddressValidation = func(net.Addr) bool { return true }
-			var initialPacketIntercepted bool
-			done := make(chan struct{})
-			delayCb := func(dir quicproxy.Direction, raw []byte) time.Duration {
-				if dir == quicproxy.DirectionIncoming && !initialPacketIntercepted {
-					defer GinkgoRecover()
-					defer close(done)
-
-					hdr, _, _, err := wire.ParsePacket(raw)
-					Expect(err).ToNot(HaveOccurred())
-
-					if hdr.Type != protocol.PacketTypeInitial {
-						return 0
-					}
-
-					initialPacketIntercepted = true
+			if d == directionToServer && hdr.Type == protocol.PacketTypeInitial {
+				once.Do(func() {
 					fakeSrcConnID := protocol.ParseConnectionID([]byte{0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12})
 					retryPacket := testutils.ComposeRetryPacket(fakeSrcConnID, hdr.SrcConnectionID, hdr.DestConnectionID, []byte("token"), hdr.Version)
-
-					_, err = serverTransport.WriteTo(retryPacket, clientTransport.Conn.LocalAddr())
-					Expect(err).ToNot(HaveOccurred())
-				}
-				return rtt / 2
+					packets = append(packets, mitmPacket{Packet: simnet.Packet{From: p.To, To: p.From, Data: retryPacket}})
+				})
 			}
-			closeFn, err := runTest(delayCb)
-			defer closeFn()
-			Expect(err).To(HaveOccurred())
-			Expect(err.(net.Error).Timeout()).To(BeTrue())
-			Eventually(done).Should(BeClosed())
+			return packets
 		})
+		serverTransport.VerifySourceAddress = func(net.Addr) bool { return true }
 
-		// times out, because client doesn't accept real retry packets from server because
-		// it has already accepted an initial.
-		// TODO: determine behavior when server does not send Retry packets
-		It("fails when a forged initial packet is sent to client", func() {
-			done := make(chan struct{})
-			var injected bool
-			delayCb := func(dir quicproxy.Direction, raw []byte) time.Duration {
-				if dir == quicproxy.DirectionIncoming {
-					defer GinkgoRecover()
-
-					hdr, _, _, err := wire.ParsePacket(raw)
-					Expect(err).ToNot(HaveOccurred())
-					if hdr.Type != protocol.PacketTypeInitial || injected {
-						return 0
-					}
-					defer close(done)
-					injected = true
-					initialPacket := testutils.ComposeInitialPacket(hdr.DestConnectionID, hdr.SrcConnectionID, hdr.Version, hdr.DestConnectionID, nil)
-					_, err = serverTransport.WriteTo(initialPacket, clientTransport.Conn.LocalAddr())
-					Expect(err).ToNot(HaveOccurred())
-				}
-				return rtt
-			}
-			closeFn, err := runTest(delayCb)
-			defer closeFn()
-			Expect(err).To(HaveOccurred())
-			Expect(err.(net.Error).Timeout()).To(BeTrue())
-			Eventually(done).Should(BeClosed())
-		})
-
-		// client connection closes immediately on receiving ack for unsent packet
-		It("fails when a forged initial packet with ack for unsent packet is sent to client", func() {
-			done := make(chan struct{})
-			var injected bool
-			delayCb := func(dir quicproxy.Direction, raw []byte) time.Duration {
-				if dir == quicproxy.DirectionIncoming {
-					defer GinkgoRecover()
-
-					hdr, _, _, err := wire.ParsePacket(raw)
-					Expect(err).ToNot(HaveOccurred())
-					if hdr.Type != protocol.PacketTypeInitial || injected {
-						return 0
-					}
-					defer close(done)
-					injected = true
-					// Fake Initial with ACK for packet 2 (unsent)
-					ack := &wire.AckFrame{AckRanges: []wire.AckRange{{Smallest: 2, Largest: 2}}}
-					initialPacket := testutils.ComposeInitialPacket(hdr.DestConnectionID, hdr.SrcConnectionID, hdr.Version, hdr.DestConnectionID, []wire.Frame{ack})
-					_, err = serverTransport.WriteTo(initialPacket, clientTransport.Conn.LocalAddr())
-					Expect(err).ToNot(HaveOccurred())
-				}
-				return rtt
-			}
-			closeFn, err := runTest(delayCb)
-			defer closeFn()
-			Expect(err).To(HaveOccurred())
-			var transportErr *quic.TransportError
-			Expect(errors.As(err, &transportErr)).To(BeTrue())
-			Expect(transportErr.ErrorCode).To(Equal(quic.ProtocolViolation))
-			Expect(transportErr.ErrorMessage).To(ContainSubstring("received ACK for an unsent packet"))
-			Eventually(done).Should(BeClosed())
-		})
+		err := runMITMTestSuccessful(t, serverTransport, clientTransport)
+		var nerr net.Error
+		require.ErrorAs(t, err, &nerr)
+		require.True(t, nerr.Timeout())
 	})
-})
+}
+
+func TestMITMForgedInitialPacket(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var once sync.Once
+		serverTransport, clientTransport := getTransportsForMITMTest(t, func(d direction, p simnet.Packet) []mitmPacket {
+			packets := []mitmPacket{{Packet: p}}
+			if d != directionToServer {
+				return packets
+			}
+			hdr, _, _, err := wire.ParsePacket(p.Data)
+			if err != nil {
+				panic("failed to parse packet: " + err.Error())
+			}
+			if hdr.Type != protocol.PacketTypeInitial {
+				return packets
+			}
+			once.Do(func() {
+				initialPacket := testutils.ComposeInitialPacket(
+					hdr.DestConnectionID,
+					hdr.SrcConnectionID,
+					hdr.DestConnectionID,
+					nil,
+					nil,
+					protocol.PerspectiveServer,
+					hdr.Version,
+				)
+				packets = append(packets, mitmPacket{Packet: simnet.Packet{From: p.To, To: p.From, Data: initialPacket}})
+			})
+			return packets
+		})
+
+		err := runMITMTestSuccessful(t, serverTransport, clientTransport)
+		var nerr net.Error
+		require.ErrorAs(t, err, &nerr)
+		require.True(t, nerr.Timeout())
+	})
+}
+
+func TestMITMForgedInitialPacketWithAck(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var once sync.Once
+		serverTransport, clientTransport := getTransportsForMITMTest(t, func(d direction, p simnet.Packet) []mitmPacket {
+			packets := []mitmPacket{{Packet: p}}
+			if d != directionToServer {
+				return packets
+			}
+			hdr, _, _, err := wire.ParsePacket(p.Data)
+			if err != nil {
+				panic("failed to parse packet: " + err.Error())
+			}
+			if hdr.Type != protocol.PacketTypeInitial {
+				return packets
+			}
+			once.Do(func() {
+				// Fake Initial with ACK for packet 2 (unsent)
+				ack := &wire.AckFrame{AckRanges: []wire.AckRange{{Smallest: 2, Largest: 2}}}
+				initialPacket := testutils.ComposeInitialPacket(
+					hdr.DestConnectionID,
+					hdr.SrcConnectionID,
+					hdr.DestConnectionID,
+					nil,
+					[]wire.Frame{ack},
+					protocol.PerspectiveServer,
+					hdr.Version,
+				)
+				packets = append(packets, mitmPacket{Packet: simnet.Packet{From: p.To, To: p.From, Data: initialPacket}})
+			})
+			return packets
+		})
+
+		err := runMITMTestSuccessful(t, serverTransport, clientTransport)
+		var transportErr *quic.TransportError
+		require.ErrorAs(t, err, &transportErr)
+		require.Equal(t, quic.ProtocolViolation, transportErr.ErrorCode)
+		require.Contains(t, transportErr.ErrorMessage, "received ACK for an unsent packet")
+	})
+}
+
+func runMITMTestSuccessful(t *testing.T, serverTransport, clientTransport *quic.Transport) error {
+	t.Helper()
+	ln, err := serverTransport.Listen(getTLSConfig(), getQuicConfig(nil))
+	require.NoError(t, err)
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err = clientTransport.Dial(ctx, ln.Addr(), getTLSClientConfig(), getQuicConfig(nil))
+	require.Error(t, err)
+	return err
+}

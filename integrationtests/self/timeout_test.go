@@ -1,358 +1,188 @@
 package self_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
-	mrand "math/rand"
+	mrand "math/rand/v2"
 	"net"
 	"sync/atomic"
+	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/quic-go/quic-go"
-	quicproxy "github.com/quic-go/quic-go/integrationtests/tools/proxy"
-	"github.com/quic-go/quic-go/internal/utils"
-	"github.com/quic-go/quic-go/logging"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
+	"github.com/quic-go/quic-go/testutils/simnet"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
-type faultyConn struct {
-	net.PacketConn
+func requireIdleTimeoutError(t *testing.T, err error) {
+	t.Helper()
 
-	MaxPackets int32
-	counter    atomic.Int32
+	var idleTimeoutErr *quic.IdleTimeoutError
+	require.ErrorAs(t, err, &idleTimeoutErr)
+	require.True(t, idleTimeoutErr.Timeout())
+	nerr, ok := errors.AsType[net.Error](err)
+	require.True(t, ok)
+	require.True(t, nerr.Timeout())
 }
 
-func (c *faultyConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	n, addr, err := c.PacketConn.ReadFrom(p)
-	counter := c.counter.Add(1)
-	if counter <= c.MaxPackets {
-		return n, addr, err
-	}
-	return 0, nil, io.ErrClosedPipe
+func TestHandshakeIdleTimeout(t *testing.T) {
+	t.Run("Dial", func(t *testing.T) {
+		testHandshakeIdleTimeout(t, quic.Dial)
+	})
+
+	t.Run("DialEarly", func(t *testing.T) {
+		testHandshakeIdleTimeout(t, quic.DialEarly)
+	})
 }
 
-func (c *faultyConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	counter := c.counter.Add(1)
-	if counter <= c.MaxPackets {
-		return c.PacketConn.WriteTo(p, addr)
-	}
-	return 0, io.ErrClosedPipe
-}
+func testHandshakeIdleTimeout(t *testing.T, dialFn func(context.Context, net.PacketConn, net.Addr, *tls.Config, *quic.Config) (*quic.Conn, error)) {
+	synctest.Test(t, func(t *testing.T) {
+		const handshakeIdleTimeout = 3 * time.Second
 
-var _ = Describe("Timeout tests", func() {
-	checkTimeoutError := func(err error) {
-		ExpectWithOffset(1, err).To(MatchError(&quic.IdleTimeoutError{}))
-		nerr, ok := err.(net.Error)
-		ExpectWithOffset(1, ok).To(BeTrue())
-		ExpectWithOffset(1, nerr.Timeout()).To(BeTrue())
-	}
+		clientPacketConn, serverPacketConn, closeFn := newSimnetLink(t, time.Millisecond)
+		defer closeFn(t)
 
-	It("returns net.Error timeout errors when dialing", func() {
-		errChan := make(chan error)
+		errChan := make(chan error, 1)
+		start := time.Now()
 		go func() {
-			_, err := quic.DialAddr(
+			_, err := dialFn(
 				context.Background(),
-				"localhost:12345",
+				clientPacketConn,
+				serverPacketConn.LocalAddr(),
 				getTLSClientConfig(),
-				getQuicConfig(&quic.Config{HandshakeIdleTimeout: scaleDuration(50 * time.Millisecond)}),
+				getQuicConfig(&quic.Config{HandshakeIdleTimeout: handshakeIdleTimeout}),
 			)
 			errChan <- err
 		}()
-		var err error
-		Eventually(errChan).Should(Receive(&err))
-		checkTimeoutError(err)
+		select {
+		case err := <-errChan:
+			requireIdleTimeoutError(t, err)
+			require.Equal(t, handshakeIdleTimeout, time.Since(start))
+		case <-time.After(5 * time.Second):
+			t.Fatal("timeout waiting for dial error")
+		}
 	})
+}
 
-	It("returns the context error when the context expires", func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-		defer cancel()
-		errChan := make(chan error)
-		go func() {
-			_, err := quic.DialAddr(
-				ctx,
-				"localhost:12345",
-				getTLSClientConfig(),
-				getQuicConfig(nil),
-			)
-			errChan <- err
-		}()
-		var err error
-		Eventually(errChan).Should(Receive(&err))
-		// This is not a net.Error timeout error
-		Expect(err).To(MatchError(context.DeadlineExceeded))
-	})
+func TestIdleTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idleTimeout = 20 * time.Second
 
-	It("returns the context error when the context expires with 0RTT enabled", func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-		defer cancel()
-		errChan := make(chan error)
-		go func() {
-			_, err := quic.DialAddrEarly(
-				ctx,
-				"localhost:12345",
-				getTLSClientConfig(),
-				getQuicConfig(nil),
-			)
-			errChan <- err
-		}()
-		var err error
-		Eventually(errChan).Should(Receive(&err))
-		// This is not a net.Error timeout error
-		Expect(err).To(MatchError(context.DeadlineExceeded))
-	})
+		var drop atomic.Bool
+		clientPacketConn, serverPacketConn, closeFn := newSimnetLinkWithRouter(t,
+			time.Millisecond,
+			&droppingRouter{Drop: func(p simnet.Packet) bool { return drop.Load() }},
+		)
+		defer closeFn(t)
 
-	It("returns net.Error timeout errors when an idle timeout occurs", func() {
-		const idleTimeout = 500 * time.Millisecond
-
-		server, err := quic.ListenAddr(
-			"localhost:0",
+		server, err := quic.Listen(
+			serverPacketConn,
 			getTLSConfig(),
 			getQuicConfig(&quic.Config{DisablePathMTUDiscovery: true}),
 		)
-		Expect(err).ToNot(HaveOccurred())
+		require.NoError(t, err)
 		defer server.Close()
 
-		go func() {
-			defer GinkgoRecover()
-			conn, err := server.Accept(context.Background())
-			Expect(err).ToNot(HaveOccurred())
-			str, err := conn.OpenStream()
-			Expect(err).ToNot(HaveOccurred())
-			_, err = str.Write([]byte("foobar"))
-			Expect(err).ToNot(HaveOccurred())
-		}()
-
-		var drop atomic.Bool
-		proxy, err := quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-			RemoteAddr: fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
-			DropPacket: func(quicproxy.Direction, []byte) bool {
-				return drop.Load()
-			},
-		})
-		Expect(err).ToNot(HaveOccurred())
-		defer proxy.Close()
-
-		conn, err := quic.DialAddr(
+		conn, err := quic.Dial(
 			context.Background(),
-			fmt.Sprintf("localhost:%d", proxy.LocalPort()),
+			clientPacketConn,
+			serverPacketConn.LocalAddr(),
 			getTLSClientConfig(),
 			getQuicConfig(&quic.Config{DisablePathMTUDiscovery: true, MaxIdleTimeout: idleTimeout}),
 		)
-		Expect(err).ToNot(HaveOccurred())
+		require.NoError(t, err)
+
+		serverConn, err := server.Accept(context.Background())
+		require.NoError(t, err)
+		str, err := serverConn.OpenStream()
+		require.NoError(t, err)
+		_, err = str.Write([]byte("foobar"))
+		require.NoError(t, err)
+
+		serverStart := time.Now()
+
 		strIn, err := conn.AcceptStream(context.Background())
-		Expect(err).ToNot(HaveOccurred())
+		require.NoError(t, err)
 		strOut, err := conn.OpenStream()
-		Expect(err).ToNot(HaveOccurred())
+		require.NoError(t, err)
 		_, err = strIn.Read(make([]byte, 6))
-		Expect(err).ToNot(HaveOccurred())
+		require.NoError(t, err)
+
+		clientStart := time.Now()
 
 		drop.Store(true)
-		time.Sleep(2 * idleTimeout)
+
+		select {
+		case <-serverConn.Context().Done():
+			took := time.Since(serverStart)
+			require.GreaterOrEqual(t, took, idleTimeout)
+			t.Logf("server connection timed out after %s (idle timeout: %s)", took, idleTimeout)
+		case <-time.After(2 * idleTimeout):
+			t.Fatal("timeout waiting for idle timeout")
+		}
+
+		select {
+		case <-conn.Context().Done():
+			took := time.Since(clientStart)
+			require.GreaterOrEqual(t, took, idleTimeout)
+			t.Logf("client connection timed out after %s (idle timeout: %s)", took, idleTimeout)
+		case <-time.After(2 * idleTimeout):
+			t.Fatal("timeout waiting for idle timeout")
+		}
+
 		_, err = strIn.Write([]byte("test"))
-		checkTimeoutError(err)
+		requireIdleTimeoutError(t, err)
 		_, err = strIn.Read([]byte{0})
-		checkTimeoutError(err)
+		requireIdleTimeoutError(t, err)
 		_, err = strOut.Write([]byte("test"))
-		checkTimeoutError(err)
+		requireIdleTimeoutError(t, err)
 		_, err = strOut.Read([]byte{0})
-		checkTimeoutError(err)
+		requireIdleTimeoutError(t, err)
 		_, err = conn.OpenStream()
-		checkTimeoutError(err)
+		requireIdleTimeoutError(t, err)
 		_, err = conn.OpenUniStream()
-		checkTimeoutError(err)
+		requireIdleTimeoutError(t, err)
 		_, err = conn.AcceptStream(context.Background())
-		checkTimeoutError(err)
+		requireIdleTimeoutError(t, err)
 		_, err = conn.AcceptUniStream(context.Background())
-		checkTimeoutError(err)
+		requireIdleTimeoutError(t, err)
 	})
+}
 
-	Context("timing out at the right time", func() {
-		var idleTimeout time.Duration
+func TestKeepAlive(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idleTimeout = 4 * time.Second
 
-		BeforeEach(func() {
-			idleTimeout = scaleDuration(500 * time.Millisecond)
-		})
+		var drop atomic.Bool
+		clientPacketConn, serverPacketConn, closeFn := newSimnetLinkWithRouter(t,
+			time.Millisecond,
+			&droppingRouter{Drop: func(p simnet.Packet) bool { return drop.Load() }},
+		)
+		defer closeFn(t)
 
-		It("times out after inactivity", func() {
-			server, err := quic.ListenAddr(
-				"localhost:0",
-				getTLSConfig(),
-				getQuicConfig(&quic.Config{DisablePathMTUDiscovery: true}),
-			)
-			Expect(err).ToNot(HaveOccurred())
-			defer server.Close()
-
-			serverConnChan := make(chan quic.Connection, 1)
-			serverConnClosed := make(chan struct{})
-			go func() {
-				defer GinkgoRecover()
-				conn, err := server.Accept(context.Background())
-				Expect(err).ToNot(HaveOccurred())
-				serverConnChan <- conn
-				conn.AcceptStream(context.Background()) // blocks until the connection is closed
-				close(serverConnClosed)
-			}()
-
-			counter, tr := newPacketTracer()
-			conn, err := quic.DialAddr(
-				context.Background(),
-				fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
-				getTLSClientConfig(),
-				getQuicConfig(&quic.Config{
-					MaxIdleTimeout:          idleTimeout,
-					Tracer:                  newTracer(tr),
-					DisablePathMTUDiscovery: true,
-				}),
-			)
-			Expect(err).ToNot(HaveOccurred())
-			done := make(chan struct{})
-			go func() {
-				defer GinkgoRecover()
-				_, err := conn.AcceptStream(context.Background())
-				checkTimeoutError(err)
-				close(done)
-			}()
-			Eventually(done, 2*idleTimeout).Should(BeClosed())
-			var lastAckElicitingPacketSentAt time.Time
-			for _, p := range counter.getSentShortHeaderPackets() {
-				var hasAckElicitingFrame bool
-				for _, f := range p.frames {
-					if _, ok := f.(*logging.AckFrame); ok {
-						continue
-					}
-					hasAckElicitingFrame = true
-					break
-				}
-				if hasAckElicitingFrame {
-					lastAckElicitingPacketSentAt = p.time
-				}
-			}
-			rcvdPackets := counter.getRcvdShortHeaderPackets()
-			lastPacketRcvdAt := rcvdPackets[len(rcvdPackets)-1].time
-			// We're ignoring here that only the first ack-eliciting packet sent resets the idle timeout.
-			// This is ok since we're dealing with a lossless connection here,
-			// and we'd expect to receive an ACK for additional other ack-eliciting packet sent.
-			Expect(time.Since(utils.MaxTime(lastAckElicitingPacketSentAt, lastPacketRcvdAt))).To(And(
-				BeNumerically(">=", idleTimeout),
-				BeNumerically("<", idleTimeout*6/5),
-			))
-			Consistently(serverConnClosed).ShouldNot(BeClosed())
-
-			// make the go routine return
-			(<-serverConnChan).CloseWithError(0, "")
-			Eventually(serverConnClosed).Should(BeClosed())
-		})
-
-		It("times out after sending a packet", func() {
-			server, err := quic.ListenAddr(
-				"localhost:0",
-				getTLSConfig(),
-				getQuicConfig(&quic.Config{DisablePathMTUDiscovery: true}),
-			)
-			Expect(err).ToNot(HaveOccurred())
-			defer server.Close()
-
-			var drop atomic.Bool
-			proxy, err := quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-				RemoteAddr: fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
-				DropPacket: func(dir quicproxy.Direction, _ []byte) bool {
-					if dir == quicproxy.DirectionOutgoing {
-						return drop.Load()
-					}
-					return false
-				},
-			})
-			Expect(err).ToNot(HaveOccurred())
-			defer proxy.Close()
-
-			serverConnChan := make(chan quic.Connection, 1)
-			serverConnClosed := make(chan struct{})
-			go func() {
-				defer GinkgoRecover()
-				conn, err := server.Accept(context.Background())
-				Expect(err).ToNot(HaveOccurred())
-				serverConnChan <- conn
-				<-conn.Context().Done() // block until the connection is closed
-				close(serverConnClosed)
-			}()
-
-			conn, err := quic.DialAddr(
-				context.Background(),
-				fmt.Sprintf("localhost:%d", proxy.LocalPort()),
-				getTLSClientConfig(),
-				getQuicConfig(&quic.Config{MaxIdleTimeout: idleTimeout, DisablePathMTUDiscovery: true}),
-			)
-			Expect(err).ToNot(HaveOccurred())
-
-			// wait half the idle timeout, then send a packet
-			time.Sleep(idleTimeout / 2)
-			drop.Store(true)
-			str, err := conn.OpenUniStream()
-			Expect(err).ToNot(HaveOccurred())
-			_, err = str.Write([]byte("foobar"))
-			Expect(err).ToNot(HaveOccurred())
-
-			// now make sure that the idle timeout is based on this packet
-			startTime := time.Now()
-			done := make(chan struct{})
-			go func() {
-				defer GinkgoRecover()
-				_, err := conn.AcceptStream(context.Background())
-				checkTimeoutError(err)
-				close(done)
-			}()
-			Eventually(done, 2*idleTimeout).Should(BeClosed())
-			dur := time.Since(startTime)
-			Expect(dur).To(And(
-				BeNumerically(">=", idleTimeout),
-				BeNumerically("<", idleTimeout*12/10),
-			))
-			Consistently(serverConnClosed).ShouldNot(BeClosed())
-
-			// make the go routine return
-			(<-serverConnChan).CloseWithError(0, "")
-			Eventually(serverConnClosed).Should(BeClosed())
-		})
-	})
-
-	It("does not time out if keepalive is set", func() {
-		const idleTimeout = 500 * time.Millisecond
-
-		server, err := quic.ListenAddr(
-			"localhost:0",
+		server, err := quic.Listen(
+			serverPacketConn,
 			getTLSConfig(),
 			getQuicConfig(&quic.Config{DisablePathMTUDiscovery: true}),
 		)
-		Expect(err).ToNot(HaveOccurred())
+		require.NoError(t, err)
 		defer server.Close()
 
-		serverConnChan := make(chan quic.Connection, 1)
-		serverConnClosed := make(chan struct{})
-		go func() {
-			defer GinkgoRecover()
-			conn, err := server.Accept(context.Background())
-			Expect(err).ToNot(HaveOccurred())
-			serverConnChan <- conn
-			conn.AcceptStream(context.Background()) // blocks until the connection is closed
-			close(serverConnClosed)
-		}()
-
-		var drop atomic.Bool
-		proxy, err := quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-			RemoteAddr: fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
-			DropPacket: func(quicproxy.Direction, []byte) bool {
-				return drop.Load()
-			},
-		})
-		Expect(err).ToNot(HaveOccurred())
-		defer proxy.Close()
-
-		conn, err := quic.DialAddr(
-			context.Background(),
-			fmt.Sprintf("localhost:%d", proxy.LocalPort()),
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		conn, err := quic.Dial(
+			ctx,
+			clientPacketConn,
+			serverPacketConn.LocalAddr(),
 			getTLSClientConfig(),
 			getQuicConfig(&quic.Config{
 				MaxIdleTimeout:          idleTimeout,
@@ -360,29 +190,210 @@ var _ = Describe("Timeout tests", func() {
 				DisablePathMTUDiscovery: true,
 			}),
 		)
-		Expect(err).ToNot(HaveOccurred())
+		require.NoError(t, err)
+
+		serverConn, err := server.Accept(ctx)
+		require.NoError(t, err)
 
 		// wait longer than the idle timeout
 		time.Sleep(3 * idleTimeout)
 		str, err := conn.OpenUniStream()
-		Expect(err).ToNot(HaveOccurred())
+		require.NoError(t, err)
 		_, err = str.Write([]byte("foobar"))
-		Expect(err).ToNot(HaveOccurred())
-		Consistently(serverConnClosed).ShouldNot(BeClosed())
+		require.NoError(t, err)
 
-		// idle timeout will still kick in if pings are dropped
+		// verify connection is still alive
+		select {
+		case <-serverConn.Context().Done():
+			t.Fatal("server connection closed unexpectedly")
+		default:
+		}
+
+		// idle timeout will still kick in if PINGs are dropped
 		drop.Store(true)
 		time.Sleep(2 * idleTimeout)
 		_, err = str.Write([]byte("foobar"))
-		checkTimeoutError(err)
+		requireIdleTimeoutError(t, err)
 
-		(<-serverConnChan).CloseWithError(0, "")
-		Eventually(serverConnClosed).Should(BeClosed())
+		// can't rely on the server connection closing, since we impose a minimum idle timeout of 5s,
+		// see https://github.com/quic-go/quic-go/issues/4751
+		serverConn.CloseWithError(0, "")
+	})
+}
+
+func TestTimeoutAfterInactivity(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idleTimeout = 15 * time.Second
+
+		clientPacketConn, serverPacketConn, closeFn := newSimnetLink(t, time.Millisecond)
+		defer closeFn(t)
+
+		server, err := quic.Listen(
+			serverPacketConn,
+			getTLSConfig(),
+			getQuicConfig(&quic.Config{DisablePathMTUDiscovery: true}),
+		)
+		require.NoError(t, err)
+		defer server.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		counter, tr := newPacketTracer()
+		conn, err := quic.Dial(
+			ctx,
+			clientPacketConn,
+			server.Addr(),
+			getTLSClientConfig(),
+			getQuicConfig(&quic.Config{
+				MaxIdleTimeout:          idleTimeout,
+				Tracer:                  func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace { return tr },
+				DisablePathMTUDiscovery: true,
+			}),
+		)
+		require.NoError(t, err)
+
+		serverConn, err := server.Accept(ctx)
+		require.NoError(t, err)
+		defer serverConn.CloseWithError(0, "")
+
+		ctx, cancel = context.WithTimeout(context.Background(), 2*idleTimeout)
+		defer cancel()
+		_, err = conn.AcceptStream(ctx)
+		requireIdleTimeoutError(t, err)
+
+		var lastAckElicitingPacketSentAt time.Time
+		for _, p := range counter.getSentShortHeaderPackets() {
+			var hasAckElicitingFrame bool
+			for _, f := range p.frames {
+				if _, ok := f.Frame.(qlog.AckFrame); ok {
+					continue
+				}
+				hasAckElicitingFrame = true
+				break
+			}
+			if hasAckElicitingFrame {
+				lastAckElicitingPacketSentAt = p.time
+			}
+		}
+		rcvdPackets := counter.getRcvdShortHeaderPackets()
+		lastPacketRcvdAt := rcvdPackets[len(rcvdPackets)-1].time
+		// We're ignoring here that only the first ack-eliciting packet sent resets the idle timeout.
+		// This is ok since we're dealing with a lossless connection here,
+		// and we'd expect to receive an ACK for additional other ack-eliciting packet sent.
+		timeSinceLastAckEliciting := time.Since(lastAckElicitingPacketSentAt)
+		timeSinceLastRcvd := time.Since(lastPacketRcvdAt)
+		require.Equal(t, idleTimeout, max(timeSinceLastAckEliciting, timeSinceLastRcvd))
+
+		select {
+		case <-serverConn.Context().Done():
+			t.Fatal("server connection closed unexpectedly")
+		default:
+		}
+	})
+}
+
+func TestTimeoutAfterSendingPacket(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const idleTimeout = 15 * time.Second
+
+		var drop atomic.Bool
+		clientPacketConn, serverPacketConn, closeFn := newSimnetLinkWithRouter(t,
+			time.Millisecond,
+			&droppingRouter{Drop: func(p simnet.Packet) bool { return drop.Load() }},
+		)
+		defer closeFn(t)
+
+		server, err := quic.Listen(
+			serverPacketConn,
+			getTLSConfig(),
+			getQuicConfig(&quic.Config{DisablePathMTUDiscovery: true}),
+		)
+		require.NoError(t, err)
+		defer server.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		conn, err := quic.Dial(
+			ctx,
+			clientPacketConn,
+			serverPacketConn.LocalAddr(),
+			getTLSClientConfig(),
+			getQuicConfig(&quic.Config{MaxIdleTimeout: idleTimeout, DisablePathMTUDiscovery: true}),
+		)
+		require.NoError(t, err)
+
+		serverConn, err := server.Accept(ctx)
+		require.NoError(t, err)
+
+		serverStart := time.Now()
+
+		// wait half the idle timeout, then send a packet
+		time.Sleep(idleTimeout / 2)
+		drop.Store(true)
+
+		clientStart := time.Now()
+		str, err := conn.OpenUniStream()
+		require.NoError(t, err)
+		_, err = str.Write([]byte("foobar"))
+		require.NoError(t, err)
+
+		select {
+		case <-serverConn.Context().Done():
+			took := time.Since(serverStart)
+			require.GreaterOrEqual(t, took, idleTimeout)
+			require.Less(t, took, idleTimeout+time.Second)
+		case <-time.After(2 * idleTimeout):
+			t.Fatal("timeout waiting for idle timeout")
+		}
+
+		select {
+		case <-conn.Context().Done():
+			took := time.Since(clientStart)
+			require.Equal(t, took, idleTimeout)
+		case <-time.After(2 * idleTimeout):
+			t.Fatal("timeout waiting for idle timeout")
+		}
+	})
+}
+
+type faultyConn struct {
+	net.PacketConn
+
+	MaxPackets int
+	counter    atomic.Int32
+}
+
+func (c *faultyConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(p)
+	counter := c.counter.Add(1)
+	if counter <= int32(c.MaxPackets) {
+		return n, addr, err
+	}
+	return 0, nil, io.ErrClosedPipe
+}
+
+func (c *faultyConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	counter := c.counter.Add(1)
+	if counter <= int32(c.MaxPackets) {
+		return c.PacketConn.WriteTo(p, addr)
+	}
+	return 0, io.ErrClosedPipe
+}
+
+func TestFaultyPacketConn(t *testing.T) {
+	t.Run("client", func(t *testing.T) {
+		testFaultyPacketConn(t, protocol.PerspectiveClient)
 	})
 
-	Context("faulty packet conns", func() {
-		const handshakeTimeout = time.Second / 2
+	t.Run("server", func(t *testing.T) {
+		testFaultyPacketConn(t, protocol.PerspectiveServer)
+	})
+}
 
+func testFaultyPacketConn(t *testing.T, pers protocol.Perspective) {
+	t.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
+
+	synctest.Test(t, func(t *testing.T) {
 		runServer := func(ln *quic.Listener) error {
 			conn, err := ln.Accept(context.Background())
 			if err != nil {
@@ -397,7 +408,7 @@ var _ = Describe("Timeout tests", func() {
 			return err
 		}
 
-		runClient := func(conn quic.Connection) error {
+		runClient := func(conn *quic.Conn) error {
 			str, err := conn.AcceptUniStream(context.Background())
 			if err != nil {
 				return err
@@ -406,126 +417,87 @@ var _ = Describe("Timeout tests", func() {
 			if err != nil {
 				return err
 			}
-			Expect(data).To(Equal(PRData))
+			if !bytes.Equal(data, PRData) {
+				return fmt.Errorf("wrong data: %q vs %q", data, PRData)
+			}
 			return conn.CloseWithError(0, "done")
 		}
 
-		It("deals with an erroring packet conn, on the server side", func() {
-			addr, err := net.ResolveUDPAddr("udp", "localhost:0")
-			Expect(err).ToNot(HaveOccurred())
-			conn, err := net.ListenUDP("udp", addr)
-			Expect(err).ToNot(HaveOccurred())
-			maxPackets := mrand.Int31n(25)
-			fmt.Fprintf(GinkgoWriter, "blocking connection after %d packets\n", maxPackets)
-			ln, err := quic.Listen(
-				&faultyConn{PacketConn: conn, MaxPackets: maxPackets},
-				getTLSConfig(),
+		clientPacketConn, serverPacketConn, closeFn := newSimnetLink(t, 100*time.Millisecond)
+		defer closeFn(t)
+
+		var cconn, sconn net.PacketConn = clientPacketConn, serverPacketConn
+		maxPackets := mrand.IntN(25)
+		// sanity check: sending PRData should generate at least 25 packets
+		require.Greater(t, len(PRData)/1500, 25)
+
+		t.Logf("blocking %s's connection after %d packets", pers, maxPackets)
+		switch pers {
+		case protocol.PerspectiveClient:
+			cconn = &faultyConn{PacketConn: cconn, MaxPackets: maxPackets}
+		case protocol.PerspectiveServer:
+			sconn = &faultyConn{PacketConn: sconn, MaxPackets: maxPackets}
+		}
+
+		ln, err := quic.Listen(
+			sconn,
+			getTLSConfig(),
+			getQuicConfig(&quic.Config{DisablePathMTUDiscovery: true}),
+		)
+		require.NoError(t, err)
+		defer ln.Close()
+
+		serverErrChan := make(chan error, 1)
+		go func() { serverErrChan <- runServer(ln) }()
+
+		clientErrChan := make(chan error, 1)
+		go func() {
+			conn, err := quic.Dial(
+				context.Background(),
+				cconn,
+				ln.Addr(),
+				getTLSClientConfig(),
 				getQuicConfig(&quic.Config{DisablePathMTUDiscovery: true}),
 			)
-			Expect(err).ToNot(HaveOccurred())
-
-			serverErrChan := make(chan error, 1)
-			go func() {
-				defer GinkgoRecover()
-				serverErrChan <- runServer(ln)
-			}()
-
-			clientErrChan := make(chan error, 1)
-			go func() {
-				defer GinkgoRecover()
-				conn, err := quic.DialAddr(
-					context.Background(),
-					fmt.Sprintf("localhost:%d", ln.Addr().(*net.UDPAddr).Port),
-					getTLSClientConfig(),
-					getQuicConfig(&quic.Config{
-						HandshakeIdleTimeout:    handshakeTimeout,
-						MaxIdleTimeout:          handshakeTimeout,
-						DisablePathMTUDiscovery: true,
-					}),
-				)
-				if err != nil {
-					clientErrChan <- err
-					return
-				}
-				clientErrChan <- runClient(conn)
-			}()
-
-			var clientErr error
-			Eventually(clientErrChan, 5*handshakeTimeout).Should(Receive(&clientErr))
-			Expect(clientErr).To(HaveOccurred())
-			nErr, ok := clientErr.(net.Error)
-			Expect(ok).To(BeTrue())
-			Expect(nErr.Timeout()).To(BeTrue())
-
-			select {
-			case serverErr := <-serverErrChan:
-				Expect(serverErr).To(HaveOccurred())
-				Expect(serverErr.Error()).To(ContainSubstring(io.ErrClosedPipe.Error()))
-				defer ln.Close()
-			default:
-				Expect(ln.Close()).To(Succeed())
-				Eventually(serverErrChan).Should(Receive())
+			if err != nil {
+				clientErrChan <- err
+				return
 			}
-		})
+			clientErrChan <- runClient(conn)
+		}()
 
-		It("deals with an erroring packet conn, on the client side", func() {
-			ln, err := quic.ListenAddr(
-				"localhost:0",
-				getTLSConfig(),
-				getQuicConfig(&quic.Config{
-					HandshakeIdleTimeout:    handshakeTimeout,
-					MaxIdleTimeout:          handshakeTimeout,
-					KeepAlivePeriod:         handshakeTimeout / 2,
-					DisablePathMTUDiscovery: true,
-				}),
-			)
-			Expect(err).ToNot(HaveOccurred())
-			defer ln.Close()
+		var clientErr error
+		select {
+		case clientErr = <-clientErrChan:
+		case <-time.After(time.Hour):
+			t.Fatal("timeout waiting for client error")
+		}
+		require.Error(t, clientErr)
+		if pers == protocol.PerspectiveClient {
+			require.ErrorContains(t, clientErr, io.ErrClosedPipe.Error())
+		} else {
+			nerr, ok := errors.AsType[net.Error](clientErr)
+			require.True(t, ok)
+			require.True(t, nerr.Timeout())
+		}
 
-			serverErrChan := make(chan error, 1)
-			go func() {
-				defer GinkgoRecover()
-				serverErrChan <- runServer(ln)
-			}()
-
-			addr, err := net.ResolveUDPAddr("udp", "localhost:0")
-			Expect(err).ToNot(HaveOccurred())
-			conn, err := net.ListenUDP("udp", addr)
-			Expect(err).ToNot(HaveOccurred())
-			maxPackets := mrand.Int31n(25)
-			fmt.Fprintf(GinkgoWriter, "blocking connection after %d packets\n", maxPackets)
-			clientErrChan := make(chan error, 1)
-			go func() {
-				defer GinkgoRecover()
-				conn, err := quic.Dial(
-					context.Background(),
-					&faultyConn{PacketConn: conn, MaxPackets: maxPackets},
-					ln.Addr(),
-					getTLSClientConfig(),
-					getQuicConfig(&quic.Config{DisablePathMTUDiscovery: true}),
-				)
-				if err != nil {
-					clientErrChan <- err
-					return
-				}
-				clientErrChan <- runClient(conn)
-			}()
-
-			var clientErr error
-			Eventually(clientErrChan, 5*handshakeTimeout).Should(Receive(&clientErr))
-			Expect(clientErr).To(HaveOccurred())
-			Expect(clientErr.Error()).To(ContainSubstring(io.ErrClosedPipe.Error()))
-			Eventually(areHandshakesRunning, 5*handshakeTimeout).Should(BeFalse())
-			select {
-			case serverErr := <-serverErrChan: // The handshake completed on the server side.
-				Expect(serverErr).To(HaveOccurred())
-				nErr, ok := serverErr.(net.Error)
-				Expect(ok).To(BeTrue())
-				Expect(nErr.Timeout()).To(BeTrue())
-			default: // The handshake didn't complete
-				Expect(ln.Close()).To(Succeed())
-				Eventually(serverErrChan).Should(Receive())
+		select {
+		case serverErr := <-serverErrChan: // The handshake completed on the server side.
+			require.Error(t, serverErr)
+			if pers == protocol.PerspectiveServer {
+				require.ErrorContains(t, serverErr, io.ErrClosedPipe.Error())
+			} else {
+				nerr, ok := errors.AsType[net.Error](serverErr)
+				require.True(t, ok)
+				require.True(t, nerr.Timeout())
 			}
-		})
+		default: // The handshake didn't complete
+			require.NoError(t, ln.Close())
+			select {
+			case <-serverErrChan:
+			case <-time.After(time.Hour):
+				t.Fatal("timeout waiting for server to close")
+			}
+		}
 	})
-})
+}

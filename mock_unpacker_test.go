@@ -5,13 +5,14 @@
 //
 //	mockgen -typed -build_flags=-tags=gomock -package quic -self_package github.com/quic-go/quic-go -destination mock_unpacker_test.go github.com/quic-go/quic-go Unpacker
 //
+
 // Package quic is a generated GoMock package.
 package quic
 
 import (
 	reflect "reflect"
-	time "time"
 
+	monotime "github.com/quic-go/quic-go/internal/monotime"
 	protocol "github.com/quic-go/quic-go/internal/protocol"
 	wire "github.com/quic-go/quic-go/internal/wire"
 	gomock "go.uber.org/mock/gomock"
@@ -21,6 +22,7 @@ import (
 type MockUnpacker struct {
 	ctrl     *gomock.Controller
 	recorder *MockUnpackerMockRecorder
+	isgomock struct{}
 }
 
 // MockUnpackerMockRecorder is the mock recorder for MockUnpacker.
@@ -41,48 +43,48 @@ func (m *MockUnpacker) EXPECT() *MockUnpackerMockRecorder {
 }
 
 // UnpackLongHeader mocks base method.
-func (m *MockUnpacker) UnpackLongHeader(arg0 *wire.Header, arg1 time.Time, arg2 []byte, arg3 protocol.VersionNumber) (*unpackedPacket, error) {
+func (m *MockUnpacker) UnpackLongHeader(hdr *wire.Header, data []byte) (*unpackedPacket, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "UnpackLongHeader", arg0, arg1, arg2, arg3)
+	ret := m.ctrl.Call(m, "UnpackLongHeader", hdr, data)
 	ret0, _ := ret[0].(*unpackedPacket)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // UnpackLongHeader indicates an expected call of UnpackLongHeader.
-func (mr *MockUnpackerMockRecorder) UnpackLongHeader(arg0, arg1, arg2, arg3 any) *UnpackerUnpackLongHeaderCall {
+func (mr *MockUnpackerMockRecorder) UnpackLongHeader(hdr, data any) *MockUnpackerUnpackLongHeaderCall {
 	mr.mock.ctrl.T.Helper()
-	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UnpackLongHeader", reflect.TypeOf((*MockUnpacker)(nil).UnpackLongHeader), arg0, arg1, arg2, arg3)
-	return &UnpackerUnpackLongHeaderCall{Call: call}
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UnpackLongHeader", reflect.TypeOf((*MockUnpacker)(nil).UnpackLongHeader), hdr, data)
+	return &MockUnpackerUnpackLongHeaderCall{Call: call}
 }
 
-// UnpackerUnpackLongHeaderCall wrap *gomock.Call
-type UnpackerUnpackLongHeaderCall struct {
+// MockUnpackerUnpackLongHeaderCall wrap *gomock.Call
+type MockUnpackerUnpackLongHeaderCall struct {
 	*gomock.Call
 }
 
 // Return rewrite *gomock.Call.Return
-func (c *UnpackerUnpackLongHeaderCall) Return(arg0 *unpackedPacket, arg1 error) *UnpackerUnpackLongHeaderCall {
+func (c *MockUnpackerUnpackLongHeaderCall) Return(arg0 *unpackedPacket, arg1 error) *MockUnpackerUnpackLongHeaderCall {
 	c.Call = c.Call.Return(arg0, arg1)
 	return c
 }
 
 // Do rewrite *gomock.Call.Do
-func (c *UnpackerUnpackLongHeaderCall) Do(f func(*wire.Header, time.Time, []byte, protocol.VersionNumber) (*unpackedPacket, error)) *UnpackerUnpackLongHeaderCall {
+func (c *MockUnpackerUnpackLongHeaderCall) Do(f func(*wire.Header, []byte) (*unpackedPacket, error)) *MockUnpackerUnpackLongHeaderCall {
 	c.Call = c.Call.Do(f)
 	return c
 }
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
-func (c *UnpackerUnpackLongHeaderCall) DoAndReturn(f func(*wire.Header, time.Time, []byte, protocol.VersionNumber) (*unpackedPacket, error)) *UnpackerUnpackLongHeaderCall {
+func (c *MockUnpackerUnpackLongHeaderCall) DoAndReturn(f func(*wire.Header, []byte) (*unpackedPacket, error)) *MockUnpackerUnpackLongHeaderCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }
 
 // UnpackShortHeader mocks base method.
-func (m *MockUnpacker) UnpackShortHeader(arg0 time.Time, arg1 []byte) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error) {
+func (m *MockUnpacker) UnpackShortHeader(rcvTime monotime.Time, data []byte) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "UnpackShortHeader", arg0, arg1)
+	ret := m.ctrl.Call(m, "UnpackShortHeader", rcvTime, data)
 	ret0, _ := ret[0].(protocol.PacketNumber)
 	ret1, _ := ret[1].(protocol.PacketNumberLen)
 	ret2, _ := ret[2].(protocol.KeyPhaseBit)
@@ -92,31 +94,31 @@ func (m *MockUnpacker) UnpackShortHeader(arg0 time.Time, arg1 []byte) (protocol.
 }
 
 // UnpackShortHeader indicates an expected call of UnpackShortHeader.
-func (mr *MockUnpackerMockRecorder) UnpackShortHeader(arg0, arg1 any) *UnpackerUnpackShortHeaderCall {
+func (mr *MockUnpackerMockRecorder) UnpackShortHeader(rcvTime, data any) *MockUnpackerUnpackShortHeaderCall {
 	mr.mock.ctrl.T.Helper()
-	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UnpackShortHeader", reflect.TypeOf((*MockUnpacker)(nil).UnpackShortHeader), arg0, arg1)
-	return &UnpackerUnpackShortHeaderCall{Call: call}
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UnpackShortHeader", reflect.TypeOf((*MockUnpacker)(nil).UnpackShortHeader), rcvTime, data)
+	return &MockUnpackerUnpackShortHeaderCall{Call: call}
 }
 
-// UnpackerUnpackShortHeaderCall wrap *gomock.Call
-type UnpackerUnpackShortHeaderCall struct {
+// MockUnpackerUnpackShortHeaderCall wrap *gomock.Call
+type MockUnpackerUnpackShortHeaderCall struct {
 	*gomock.Call
 }
 
 // Return rewrite *gomock.Call.Return
-func (c *UnpackerUnpackShortHeaderCall) Return(arg0 protocol.PacketNumber, arg1 protocol.PacketNumberLen, arg2 protocol.KeyPhaseBit, arg3 []byte, arg4 error) *UnpackerUnpackShortHeaderCall {
+func (c *MockUnpackerUnpackShortHeaderCall) Return(arg0 protocol.PacketNumber, arg1 protocol.PacketNumberLen, arg2 protocol.KeyPhaseBit, arg3 []byte, arg4 error) *MockUnpackerUnpackShortHeaderCall {
 	c.Call = c.Call.Return(arg0, arg1, arg2, arg3, arg4)
 	return c
 }
 
 // Do rewrite *gomock.Call.Do
-func (c *UnpackerUnpackShortHeaderCall) Do(f func(time.Time, []byte) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error)) *UnpackerUnpackShortHeaderCall {
+func (c *MockUnpackerUnpackShortHeaderCall) Do(f func(monotime.Time, []byte) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error)) *MockUnpackerUnpackShortHeaderCall {
 	c.Call = c.Call.Do(f)
 	return c
 }
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
-func (c *UnpackerUnpackShortHeaderCall) DoAndReturn(f func(time.Time, []byte) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error)) *UnpackerUnpackShortHeaderCall {
+func (c *MockUnpackerUnpackShortHeaderCall) DoAndReturn(f func(monotime.Time, []byte) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error)) *MockUnpackerUnpackShortHeaderCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }

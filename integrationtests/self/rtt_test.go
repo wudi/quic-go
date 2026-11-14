@@ -2,112 +2,182 @@ package self_test
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"io"
+	"math/rand/v2"
 	"net"
+	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/quic-go/quic-go"
-	quicproxy "github.com/quic-go/quic-go/integrationtests/tools/proxy"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/qlogwriter"
+	"github.com/quic-go/quic-go/testutils/simnet"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("non-zero RTT", func() {
-	runServer := func() *quic.Listener {
-		ln, err := quic.ListenAddr(
-			"localhost:0",
-			getTLSConfig(),
-			getQuicConfig(nil),
-		)
-		Expect(err).ToNot(HaveOccurred())
-		go func() {
-			defer GinkgoRecover()
+func runServerForRTTTest(t *testing.T, serverConn net.PacketConn) <-chan *quic.Conn {
+	t.Helper()
+
+	ln, err := quic.Listen(serverConn, getTLSConfig(), getQuicConfig(nil))
+	require.NoError(t, err)
+	t.Cleanup(func() { ln.Close() })
+
+	connChan := make(chan *quic.Conn, 1)
+	go func() {
+		for {
 			conn, err := ln.Accept(context.Background())
-			Expect(err).ToNot(HaveOccurred())
+			if err != nil {
+				if !errors.Is(err, net.ErrClosed) {
+					t.Logf("accept error: %v", err)
+				}
+				return
+			}
+			connChan <- conn
 			str, err := conn.OpenStream()
-			Expect(err).ToNot(HaveOccurred())
-			_, err = str.Write(PRData)
-			Expect(err).ToNot(HaveOccurred())
+			if err != nil {
+				t.Logf("open stream error: %v", err)
+				return
+			}
+			if _, err := str.Write(PRData); err != nil {
+				t.Logf("write error: %v", err)
+				return
+			}
 			str.Close()
-		}()
-		return ln
-	}
+		}
+	}()
 
-	downloadFile := func(port int) {
-		conn, err := quic.DialAddr(
-			context.Background(),
-			fmt.Sprintf("localhost:%d", port),
-			getTLSClientConfig(),
-			getQuicConfig(nil),
-		)
-		Expect(err).ToNot(HaveOccurred())
-		str, err := conn.AcceptStream(context.Background())
-		Expect(err).ToNot(HaveOccurred())
-		data, err := io.ReadAll(str)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(data).To(Equal(PRData))
-		conn.CloseWithError(0, "")
-	}
+	return connChan
+}
 
-	for _, r := range [...]time.Duration{
+func TestDownloadWithFixedRTT(t *testing.T) {
+	for _, rtt := range []time.Duration{
 		10 * time.Millisecond,
-		50 * time.Millisecond,
 		100 * time.Millisecond,
-		200 * time.Millisecond,
+		500 * time.Millisecond,
 	} {
-		rtt := r
+		t.Run(rtt.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				clientConn, serverConn, closeFn := newSimnetLink(t, rtt)
+				defer closeFn(t)
 
-		It(fmt.Sprintf("downloads a message with %s RTT", rtt), func() {
-			ln := runServer()
-			defer ln.Close()
-			serverPort := ln.Addr().(*net.UDPAddr).Port
-			proxy, err := quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-				RemoteAddr: fmt.Sprintf("localhost:%d", serverPort),
-				DelayPacket: func(quicproxy.Direction, []byte) time.Duration {
-					return rtt / 2
-				},
+				sconnChan := runServerForRTTTest(t, serverConn)
+
+				ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+				defer cancel()
+				conn, err := quic.Dial(
+					ctx,
+					clientConn,
+					serverConn.LocalAddr(),
+					getTLSClientConfig(),
+					getQuicConfig(nil),
+				)
+				require.NoError(t, err)
+				defer conn.CloseWithError(0, "")
+
+				str, err := conn.AcceptStream(ctx)
+				require.NoError(t, err)
+				data, err := io.ReadAll(str)
+				require.NoError(t, err)
+				require.Equal(t, PRData, data)
+
+				sconn := <-sconnChan
+				defer sconn.CloseWithError(0, "")
+
+				checkRTTs := func(stats quic.ConnectionStats) {
+					t.Helper()
+					require.NotZero(t, stats.CongestionWindow)
+					require.GreaterOrEqual(t, stats.SmoothedRTT, rtt)
+					require.GreaterOrEqual(t, stats.MinRTT, rtt)
+					require.LessOrEqual(t, stats.SmoothedRTT, rtt+time.Millisecond)
+					require.LessOrEqual(t, stats.MinRTT, rtt+time.Millisecond)
+				}
+				checkRTTs(conn.ConnectionStats())
+				checkRTTs(sconn.ConnectionStats())
 			})
-			Expect(err).ToNot(HaveOccurred())
-			defer proxy.Close()
-
-			conn, err := quic.DialAddr(
-				context.Background(),
-				fmt.Sprintf("localhost:%d", proxy.LocalPort()),
-				getTLSClientConfig(),
-				getQuicConfig(nil),
-			)
-			Expect(err).ToNot(HaveOccurred())
-			str, err := conn.AcceptStream(context.Background())
-			Expect(err).ToNot(HaveOccurred())
-			data, err := io.ReadAll(str)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(data).To(Equal(PRData))
-			conn.CloseWithError(0, "")
 		})
 	}
+}
 
-	for _, r := range [...]time.Duration{
-		10 * time.Millisecond,
-		40 * time.Millisecond,
+func TestDownloadWithReordering(t *testing.T) {
+	for _, rtt := range []time.Duration{
+		5 * time.Millisecond,
+		50 * time.Millisecond,
+		250 * time.Millisecond,
 	} {
-		rtt := r
+		t.Run(rtt.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				counter, tracer := newPacketTracer()
 
-		It(fmt.Sprintf("downloads a message with %s RTT, with reordering", rtt), func() {
-			ln := runServer()
-			defer ln.Close()
-			serverPort := ln.Addr().(*net.UDPAddr).Port
-			proxy, err := quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-				RemoteAddr: fmt.Sprintf("localhost:%d", serverPort),
-				DelayPacket: func(quicproxy.Direction, []byte) time.Duration {
-					return randomDuration(rtt/2, rtt*3/2) / 2
-				},
+				n := &simnet.Simnet{Router: &simnet.PerfectRouter{}}
+				settings := simnet.NodeBiDiLinkSettings{
+					LatencyFunc: func(simnet.Packet) time.Duration {
+						min := rtt * 9 / 10
+						max := rtt * 11 / 10
+						return (min + time.Duration(rand.IntN(int(max-min)))) / 2
+					},
+				}
+				clientConn := n.NewEndpoint(&net.UDPAddr{IP: net.ParseIP("1.0.0.1"), Port: 9001}, settings)
+				serverConn := n.NewEndpoint(&net.UDPAddr{IP: net.ParseIP("1.0.0.2"), Port: 9002}, settings)
+				defer func() {
+					require.NoError(t, clientConn.Close())
+					require.NoError(t, serverConn.Close())
+					require.NoError(t, n.Close())
+				}()
+
+				sconnChan := runServerForRTTTest(t, serverConn)
+
+				ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+				defer cancel()
+				conn, err := quic.Dial(
+					ctx,
+					clientConn,
+					serverConn.LocalAddr(),
+					getTLSClientConfig(),
+					getQuicConfig(&quic.Config{
+						Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace { return tracer },
+					}),
+				)
+				require.NoError(t, err)
+				defer conn.CloseWithError(0, "")
+
+				str, err := conn.AcceptStream(ctx)
+				require.NoError(t, err)
+				data, err := io.ReadAll(str)
+				require.NoError(t, err)
+				require.Equal(t, PRData, data)
+
+				sconn := <-sconnChan
+				defer sconn.CloseWithError(0, "")
+
+				packets := counter.getRcvdShortHeaderPackets()
+				var packetNumbers []protocol.PacketNumber
+				for _, p := range packets {
+					packetNumbers = append(packetNumbers, p.hdr.PacketNumber)
+				}
+
+				// Count reorderings: a reordering occurs when we receive a packet
+				// with a number lower than the highest number we've seen so far
+				var reorderings int
+				var highestSeen protocol.PacketNumber
+				for _, pn := range packetNumbers {
+					if pn < highestSeen {
+						reorderings++
+					}
+					if pn > highestSeen {
+						highestSeen = pn
+					}
+				}
+
+				t.Logf("Smoothed RTT: %s", conn.ConnectionStats().SmoothedRTT)
+				assert.GreaterOrEqual(t, conn.ConnectionStats().SmoothedRTT, rtt*9/10)
+				assert.LessOrEqual(t, conn.ConnectionStats().SmoothedRTT, rtt*11/10)
+				t.Logf("received %d short header packets, detected %d reorderings", len(packetNumbers), reorderings)
+				assert.GreaterOrEqual(t, reorderings, 20, "expected at least 20 reorderings")
 			})
-			Expect(err).ToNot(HaveOccurred())
-			defer proxy.Close()
-
-			downloadFile(proxy.LocalPort())
 		})
 	}
-})
+}

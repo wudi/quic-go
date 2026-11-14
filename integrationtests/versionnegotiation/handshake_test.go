@@ -2,192 +2,206 @@ package versionnegotiation
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
+	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/integrationtests/tools/israce"
 	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/logging"
+	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
+	"github.com/quic-go/quic-go/testutils/events"
+	"github.com/quic-go/quic-go/testutils/simnet"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
-type versioner interface {
-	GetVersion() protocol.VersionNumber
-}
+func TestServerSupportsMoreVersionsThanClient(t *testing.T) {
+	supportedVersions := append([]quic.Version{}, protocol.SupportedVersions...)
+	protocol.SupportedVersions = append(protocol.SupportedVersions, []protocol.Version{7, 8, 9, 10}...)
+	defer func() { protocol.SupportedVersions = supportedVersions }()
 
-type result struct {
-	loggedVersions                 bool
-	receivedVersionNegotiation     bool
-	chosen                         logging.VersionNumber
-	clientVersions, serverVersions []logging.VersionNumber
-}
-
-func newVersionNegotiationTracer() (*result, *logging.ConnectionTracer) {
-	r := &result{}
-	return r, &logging.ConnectionTracer{
-		NegotiatedVersion: func(chosen logging.VersionNumber, clientVersions, serverVersions []logging.VersionNumber) {
-			if r.loggedVersions {
-				Fail("only expected one call to NegotiatedVersions")
-			}
-			r.loggedVersions = true
-			r.chosen = chosen
-			r.clientVersions = clientVersions
-			r.serverVersions = serverVersions
-		},
-		ReceivedVersionNegotiationPacket: func(dest, src logging.ArbitraryLenConnectionID, _ []logging.VersionNumber) {
-			r.receivedVersionNegotiation = true
+	var serverEventTracer events.Recorder
+	serverConfig := &quic.Config{
+		Versions: []protocol.Version{7, 8, protocol.SupportedVersions[0], 9},
+		Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
+			return &events.Trace{Recorder: &serverEventTracer}
 		},
 	}
+	server, err := quic.ListenAddr("localhost:0", getTLSConfig(), serverConfig)
+	require.NoError(t, err)
+	defer server.Close()
+
+	var clientEventTracer events.Recorder
+	conn, err := quic.DialAddr(
+		context.Background(),
+		fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
+		getTLSClientConfig(),
+		maybeAddQLOGTracer(&quic.Config{Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
+			return &events.Trace{Recorder: &clientEventTracer}
+		}}),
+	)
+	require.NoError(t, err)
+
+	expectedVersion := protocol.SupportedVersions[0]
+	sconn, err := server.Accept(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, expectedVersion, sconn.ConnectionState().Version)
+
+	require.Equal(t, expectedVersion, conn.ConnectionState().Version)
+	require.NoError(t, conn.CloseWithError(0, ""))
+
+	select {
+	case <-sconn.Context().Done():
+		// Expected behavior
+	case <-time.After(5 * time.Second):
+		t.Fatal("Timeout waiting for connection to close")
+	}
+
+	require.Empty(t, clientEventTracer.Events(qlog.VersionNegotiationReceived{}))
+	require.Equal(t,
+		[]qlogwriter.Event{
+			qlog.VersionInformation{
+				ClientVersions: protocol.SupportedVersions,
+				ChosenVersion:  expectedVersion,
+			},
+		},
+		clientEventTracer.Events(qlog.VersionInformation{}),
+	)
+	require.Equal(t,
+		[]qlogwriter.Event{
+			qlog.VersionInformation{
+				ServerVersions: serverConfig.Versions,
+				ChosenVersion:  expectedVersion,
+			},
+		},
+		serverEventTracer.Events(qlog.VersionInformation{}),
+	)
 }
 
-var _ = Describe("Handshake tests", func() {
-	startServer := func(tlsConf *tls.Config, conf *quic.Config) (*quic.Listener, func()) {
-		server, err := quic.ListenAddr("localhost:0", tlsConf, conf)
-		Expect(err).ToNot(HaveOccurred())
+func TestClientSupportsMoreVersionsThanServer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		supportedVersions := append([]quic.Version{}, protocol.SupportedVersions...)
+		protocol.SupportedVersions = append(protocol.SupportedVersions, []protocol.Version{7, 8, 9, 10}...)
+		defer func() { protocol.SupportedVersions = supportedVersions }()
 
-		acceptStopped := make(chan struct{})
-		go func() {
-			defer GinkgoRecover()
-			defer close(acceptStopped)
-			for {
-				if _, err := server.Accept(context.Background()); err != nil {
-					return
-				}
-			}
-		}()
+		n := &simnet.Simnet{Router: &simnet.PerfectRouter{}}
+		settings := simnet.NodeBiDiLinkSettings{Latency: 5 * time.Millisecond}
+		clientPacketConn := n.NewEndpoint(&net.UDPAddr{IP: net.ParseIP("1.0.0.1"), Port: 9001}, settings)
+		defer clientPacketConn.Close()
+		serverPacketConn := n.NewEndpoint(&net.UDPAddr{IP: net.ParseIP("1.0.0.2"), Port: 9002}, settings)
+		defer serverPacketConn.Close()
+		defer n.Close()
 
-		return server, func() {
-			server.Close()
-			<-acceptStopped
+		expectedVersion := protocol.SupportedVersions[0]
+		// The server doesn't support the highest supported version, which is the first one the client will try,
+		// but it supports a bunch of versions that the client doesn't speak
+		var serverEventTracer events.Recorder
+		serverConfig := &quic.Config{
+			Versions: supportedVersions,
+			Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
+				return &events.Trace{Recorder: &serverEventTracer}
+			},
 		}
-	}
+		server, err := quic.Listen(serverPacketConn, getTLSConfig(), serverConfig)
+		require.NoError(t, err)
+		defer server.Close()
 
-	var supportedVersions []protocol.VersionNumber
+		clientVersions := []protocol.Version{7, 8, 9, protocol.SupportedVersions[0], 10}
+		var clientEventTracer events.Recorder
+		conn, err := quic.Dial(
+			context.Background(),
+			clientPacketConn,
+			serverPacketConn.LocalAddr(),
+			getTLSClientConfig(),
+			maybeAddQLOGTracer(&quic.Config{
+				Versions: clientVersions,
+				Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
+					return &events.Trace{Recorder: &clientEventTracer}
+				},
+			}),
+		)
+		require.NoError(t, err)
 
-	BeforeEach(func() {
-		supportedVersions = append([]quic.VersionNumber{}, protocol.SupportedVersions...)
-		protocol.SupportedVersions = append(protocol.SupportedVersions, []protocol.VersionNumber{7, 8, 9, 10}...)
+		sconn, err := server.Accept(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, expectedVersion, sconn.ConnectionState().Version)
+
+		require.Equal(t, protocol.SupportedVersions[0], conn.ConnectionState().Version)
+		// the client must still receive packets after 3 PTOs of the old connection
+		time.Sleep(time.Second)
+		require.NoError(t, sconn.CloseWithError(0, ""))
+
+		select {
+		case <-conn.Context().Done():
+			// Expected behavior
+		case <-time.After(5 * time.Second):
+			t.Fatal("Timeout waiting for connection to close")
+		}
+
+		require.Len(t, clientEventTracer.Events(qlog.VersionNegotiationReceived{}), 1)
+		supportedVersionInclGreased := clientEventTracer.Events(qlog.VersionNegotiationReceived{})[0].(qlog.VersionNegotiationReceived).SupportedVersions
+		require.Equal(t,
+			[]qlogwriter.Event{
+				qlog.VersionInformation{
+					ClientVersions: clientVersions,
+					ServerVersions: supportedVersionInclGreased,
+					ChosenVersion:  expectedVersion,
+				},
+			},
+			clientEventTracer.Events(qlog.VersionInformation{}),
+		)
+		require.Equal(t,
+			[]qlogwriter.Event{
+				qlog.VersionInformation{
+					ServerVersions: supportedVersions,
+					ChosenVersion:  expectedVersion,
+				},
+			},
+			serverEventTracer.Events(qlog.VersionInformation{}),
+		)
 	})
+}
 
-	AfterEach(func() {
-		protocol.SupportedVersions = supportedVersions
-	})
-
-	if !israce.Enabled {
-		It("when the server supports more versions than the client", func() {
-			expectedVersion := protocol.SupportedVersions[0]
-			// the server doesn't support the highest supported version, which is the first one the client will try
-			// but it supports a bunch of versions that the client doesn't speak
-			serverConfig := &quic.Config{}
-			serverConfig.Versions = []protocol.VersionNumber{7, 8, protocol.SupportedVersions[0], 9}
-			serverResult, serverTracer := newVersionNegotiationTracer()
-			serverConfig.Tracer = func(context.Context, logging.Perspective, quic.ConnectionID) *logging.ConnectionTracer {
-				return serverTracer
-			}
-			server, cl := startServer(getTLSConfig(), serverConfig)
-			defer cl()
-			clientResult, clientTracer := newVersionNegotiationTracer()
-			conn, err := quic.DialAddr(
-				context.Background(),
-				fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
-				getTLSClientConfig(),
-				maybeAddQLOGTracer(&quic.Config{Tracer: func(ctx context.Context, perspective logging.Perspective, id quic.ConnectionID) *logging.ConnectionTracer {
-					return clientTracer
-				}}),
-			)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(conn.(versioner).GetVersion()).To(Equal(expectedVersion))
-			Expect(conn.CloseWithError(0, "")).To(Succeed())
-			Expect(clientResult.chosen).To(Equal(expectedVersion))
-			Expect(clientResult.receivedVersionNegotiation).To(BeFalse())
-			Expect(clientResult.clientVersions).To(Equal(protocol.SupportedVersions))
-			Expect(clientResult.serverVersions).To(BeEmpty())
-			Expect(serverResult.chosen).To(Equal(expectedVersion))
-			Expect(serverResult.serverVersions).To(Equal(serverConfig.Versions))
-			Expect(serverResult.clientVersions).To(BeEmpty())
-		})
-
-		It("when the client supports more versions than the server supports", func() {
-			expectedVersion := protocol.SupportedVersions[0]
-			// The server doesn't support the highest supported version, which is the first one the client will try,
-			// but it supports a bunch of versions that the client doesn't speak
-			serverResult, serverTracer := newVersionNegotiationTracer()
-			serverConfig := &quic.Config{}
-			serverConfig.Versions = supportedVersions
-			serverConfig.Tracer = func(context.Context, logging.Perspective, quic.ConnectionID) *logging.ConnectionTracer {
-				return serverTracer
-			}
-			server, cl := startServer(getTLSConfig(), serverConfig)
-			defer cl()
-			clientVersions := []protocol.VersionNumber{7, 8, 9, protocol.SupportedVersions[0], 10}
-			clientResult, clientTracer := newVersionNegotiationTracer()
-			conn, err := quic.DialAddr(
-				context.Background(),
-				fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port),
-				getTLSClientConfig(),
-				maybeAddQLOGTracer(&quic.Config{
-					Versions: clientVersions,
-					Tracer: func(context.Context, logging.Perspective, quic.ConnectionID) *logging.ConnectionTracer {
-						return clientTracer
-					},
-				}),
-			)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(conn.(versioner).GetVersion()).To(Equal(protocol.SupportedVersions[0]))
-			Expect(conn.CloseWithError(0, "")).To(Succeed())
-			Expect(clientResult.chosen).To(Equal(expectedVersion))
-			Expect(clientResult.receivedVersionNegotiation).To(BeTrue())
-			Expect(clientResult.clientVersions).To(Equal(clientVersions))
-			Expect(clientResult.serverVersions).To(ContainElements(supportedVersions)) // may contain greased versions
-			Expect(serverResult.chosen).To(Equal(expectedVersion))
-			Expect(serverResult.serverVersions).To(Equal(serverConfig.Versions))
-			Expect(serverResult.clientVersions).To(BeEmpty())
-		})
-
-		It("fails if the server disables version negotiation", func() {
-			// The server doesn't support the highest supported version, which is the first one the client will try,
-			// but it supports a bunch of versions that the client doesn't speak
-			_, serverTracer := newVersionNegotiationTracer()
-			serverConfig := &quic.Config{}
-			serverConfig.Versions = supportedVersions
-			serverConfig.Tracer = func(context.Context, logging.Perspective, quic.ConnectionID) *logging.ConnectionTracer {
-				return serverTracer
-			}
-			conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-			Expect(err).ToNot(HaveOccurred())
-			tr := &quic.Transport{
-				Conn:                             conn,
-				DisableVersionNegotiationPackets: true,
-			}
-			ln, err := tr.Listen(getTLSConfig(), serverConfig)
-			Expect(err).ToNot(HaveOccurred())
-			defer ln.Close()
-
-			clientVersions := []protocol.VersionNumber{7, 8, 9, protocol.SupportedVersions[0], 10}
-			clientResult, clientTracer := newVersionNegotiationTracer()
-			_, err = quic.DialAddr(
-				context.Background(),
-				fmt.Sprintf("localhost:%d", conn.LocalAddr().(*net.UDPAddr).Port),
-				getTLSClientConfig(),
-				maybeAddQLOGTracer(&quic.Config{
-					Versions: clientVersions,
-					Tracer: func(context.Context, logging.Perspective, quic.ConnectionID) *logging.ConnectionTracer {
-						return clientTracer
-					},
-					HandshakeIdleTimeout: 100 * time.Millisecond,
-				}),
-			)
-			Expect(err).To(HaveOccurred())
-			var nerr net.Error
-			Expect(errors.As(err, &nerr)).To(BeTrue())
-			Expect(nerr.Timeout()).To(BeTrue())
-			Expect(clientResult.receivedVersionNegotiation).To(BeFalse())
-		})
+func TestServerDisablesVersionNegotiation(t *testing.T) {
+	// The server doesn't support the highest supported version, which is the first one the client will try,
+	// but it supports a bunch of versions that the client doesn't speak
+	var serverEventTracer events.Recorder
+	serverConfig := &quic.Config{
+		Versions: []protocol.Version{quic.Version1},
+		Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
+			return &events.Trace{Recorder: &serverEventTracer}
+		},
 	}
-})
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	tr := &quic.Transport{
+		Conn:                             conn,
+		DisableVersionNegotiationPackets: true,
+	}
+	ln, err := tr.Listen(getTLSConfig(), serverConfig)
+	require.NoError(t, err)
+	defer ln.Close()
+
+	var clientEventTracer events.Recorder
+	_, err = quic.DialAddr(
+		context.Background(),
+		fmt.Sprintf("localhost:%d", conn.LocalAddr().(*net.UDPAddr).Port),
+		getTLSClientConfig(),
+		maybeAddQLOGTracer(&quic.Config{
+			Versions: []protocol.Version{quic.Version2},
+			Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
+				return &events.Trace{Recorder: &clientEventTracer}
+			},
+			HandshakeIdleTimeout: 100 * time.Millisecond,
+		}),
+	)
+	require.Error(t, err)
+	nerr, ok := errors.AsType[net.Error](err)
+	require.True(t, ok)
+	require.True(t, nerr.Timeout())
+	require.Empty(t, clientEventTracer.Events(qlog.VersionNegotiationReceived{}))
+}

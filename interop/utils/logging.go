@@ -11,8 +11,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/internal/utils"
-	"github.com/quic-go/quic-go/logging"
-	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
 )
 
 // GetSSLKeyLog creates a file for the TLS key log
@@ -29,7 +28,7 @@ func GetSSLKeyLog() (io.WriteCloser, error) {
 }
 
 // NewQLOGConnectionTracer create a qlog file in QLOGDIR
-func NewQLOGConnectionTracer(_ context.Context, p logging.Perspective, connID quic.ConnectionID) *logging.ConnectionTracer {
+func NewQLOGConnectionTracer(_ context.Context, isClient bool, connID quic.ConnectionID) qlogwriter.Trace {
 	qlogDir := os.Getenv("QLOGDIR")
 	if len(qlogDir) == 0 {
 		return nil
@@ -39,12 +38,18 @@ func NewQLOGConnectionTracer(_ context.Context, p logging.Perspective, connID qu
 			log.Fatalf("failed to create qlog dir %s: %v", qlogDir, err)
 		}
 	}
-	path := fmt.Sprintf("%s/%s.qlog", strings.TrimRight(qlogDir, "/"), connID)
+	path := fmt.Sprintf("%s/%s.sqlog", strings.TrimRight(qlogDir, "/"), connID)
 	f, err := os.Create(path)
 	if err != nil {
 		log.Printf("Failed to create qlog file %s: %s", path, err.Error())
 		return nil
 	}
 	log.Printf("Created qlog file: %s\n", path)
-	return qlog.NewConnectionTracer(utils.NewBufferedWriteCloser(bufio.NewWriter(f), f), p, connID)
+	fileSeq := qlogwriter.NewConnectionFileSeq(
+		utils.NewBufferedWriteCloser(bufio.NewWriter(f), f),
+		isClient,
+		connID,
+	)
+	go fileSeq.Run()
+	return fileSeq
 }

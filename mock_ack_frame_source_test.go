@@ -5,12 +5,14 @@
 //
 //	mockgen -typed -build_flags=-tags=gomock -package quic -self_package github.com/quic-go/quic-go -destination mock_ack_frame_source_test.go github.com/quic-go/quic-go AckFrameSource
 //
+
 // Package quic is a generated GoMock package.
 package quic
 
 import (
 	reflect "reflect"
 
+	monotime "github.com/quic-go/quic-go/internal/monotime"
 	protocol "github.com/quic-go/quic-go/internal/protocol"
 	wire "github.com/quic-go/quic-go/internal/wire"
 	gomock "go.uber.org/mock/gomock"
@@ -20,6 +22,7 @@ import (
 type MockAckFrameSource struct {
 	ctrl     *gomock.Controller
 	recorder *MockAckFrameSourceMockRecorder
+	isgomock struct{}
 }
 
 // MockAckFrameSourceMockRecorder is the mock recorder for MockAckFrameSource.
@@ -40,39 +43,39 @@ func (m *MockAckFrameSource) EXPECT() *MockAckFrameSourceMockRecorder {
 }
 
 // GetAckFrame mocks base method.
-func (m *MockAckFrameSource) GetAckFrame(arg0 protocol.EncryptionLevel, arg1 bool) *wire.AckFrame {
+func (m *MockAckFrameSource) GetAckFrame(arg0 protocol.EncryptionLevel, now monotime.Time, onlyIfQueued bool) *wire.AckFrame {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetAckFrame", arg0, arg1)
+	ret := m.ctrl.Call(m, "GetAckFrame", arg0, now, onlyIfQueued)
 	ret0, _ := ret[0].(*wire.AckFrame)
 	return ret0
 }
 
 // GetAckFrame indicates an expected call of GetAckFrame.
-func (mr *MockAckFrameSourceMockRecorder) GetAckFrame(arg0, arg1 any) *AckFrameSourceGetAckFrameCall {
+func (mr *MockAckFrameSourceMockRecorder) GetAckFrame(arg0, now, onlyIfQueued any) *MockAckFrameSourceGetAckFrameCall {
 	mr.mock.ctrl.T.Helper()
-	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetAckFrame", reflect.TypeOf((*MockAckFrameSource)(nil).GetAckFrame), arg0, arg1)
-	return &AckFrameSourceGetAckFrameCall{Call: call}
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetAckFrame", reflect.TypeOf((*MockAckFrameSource)(nil).GetAckFrame), arg0, now, onlyIfQueued)
+	return &MockAckFrameSourceGetAckFrameCall{Call: call}
 }
 
-// AckFrameSourceGetAckFrameCall wrap *gomock.Call
-type AckFrameSourceGetAckFrameCall struct {
+// MockAckFrameSourceGetAckFrameCall wrap *gomock.Call
+type MockAckFrameSourceGetAckFrameCall struct {
 	*gomock.Call
 }
 
 // Return rewrite *gomock.Call.Return
-func (c *AckFrameSourceGetAckFrameCall) Return(arg0 *wire.AckFrame) *AckFrameSourceGetAckFrameCall {
+func (c *MockAckFrameSourceGetAckFrameCall) Return(arg0 *wire.AckFrame) *MockAckFrameSourceGetAckFrameCall {
 	c.Call = c.Call.Return(arg0)
 	return c
 }
 
 // Do rewrite *gomock.Call.Do
-func (c *AckFrameSourceGetAckFrameCall) Do(f func(protocol.EncryptionLevel, bool) *wire.AckFrame) *AckFrameSourceGetAckFrameCall {
+func (c *MockAckFrameSourceGetAckFrameCall) Do(f func(protocol.EncryptionLevel, monotime.Time, bool) *wire.AckFrame) *MockAckFrameSourceGetAckFrameCall {
 	c.Call = c.Call.Do(f)
 	return c
 }
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
-func (c *AckFrameSourceGetAckFrameCall) DoAndReturn(f func(protocol.EncryptionLevel, bool) *wire.AckFrame) *AckFrameSourceGetAckFrameCall {
+func (c *MockAckFrameSourceGetAckFrameCall) DoAndReturn(f func(protocol.EncryptionLevel, monotime.Time, bool) *wire.AckFrame) *MockAckFrameSourceGetAckFrameCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }
